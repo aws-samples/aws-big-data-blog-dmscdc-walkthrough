@@ -21,7 +21,7 @@ This solution uses a Python shell job for the Controller. The controller will ru
 ### Controller
 The controller job will leverage the state table stored in DynamoDB and compare the state with the files in S3.  It will determine which tables/files need to be processed.
 
-The first step in the processing is to determine the *folders* which are located in DMS raw location and construct and item object representing the default values for the folder.  Each *folder* would represent a table in your source database which will have changes streamed into S3.  
+The first step in the processing is to determine the *folders* which are located in DMS raw location and construct an *item* object representing the default values for the *folder*.  Each *folder* represents a table in your source database which will have changes streamed into S3.  
 ```python
 #get the list of table folders
 s3_input = 's3://'+bucket+'/'+prefix
@@ -82,7 +82,7 @@ The next step is to pull the state of each table from the DMSCDC_Controller Dyna
 
 In the next step, the controller determines if the initial file needs to be processed by comparing the timestamp of the initial load file stored in the DynamoDB table with the timestamp retrieved from S3.  If it is determined that the initial file should be processed the [LoadInitial](#LoadInitial) glue job is triggered.  The controller will wait for its completion using the *testGlueJob* function. If the job completes successfully, the DynamoDB table will be updated with the timestamp of the file which was processed.
 
-Note: if the DynamoDB table has the ActiveFlag != 'true', this table will be skipped.  This is to ensure that a user has reviewed the table and set appropriate keys. If the PartitionKey has been set, the Spark job will partition the data before it is written.  If the PrimaryKey has been set, the incremental load will conduct change detection logic.
+Note: if the DynamoDB table has the ActiveFlag != 'true', this table will be skipped.  This is to ensure that a user has reviewed the table and set appropriate keys. If the PrimaryKey has been set, the incremental load will conduct change detection logic.  If the PrimaryKey has NOT been set, incremental load will only load rows marked for insert. If the PartitionKey has been set, the Spark job will partition the data before it is written.  
 ```python
     loadInitial = False
     #determine if need to run initial --> Run Initial --> Update DDB
@@ -124,7 +124,7 @@ Note: if the DynamoDB table has the ActiveFlag != 'true', this table will be ski
                 Key={"path": {"S":path}},
                 AttributeUpdates={"LastFullLoadDate": {"Value": {"S": lastFullLoadDate}}})
 ```
-In the final step, the controller determines if any incremental files need to be processed by comparing the *lastIncrementalFile* stored in the DynamoDB table with the *newIncrementalFile* retrieved from S3.  If those two values are different it is determined that there are incremental files and the [LoadIncremental](#LoadIncremental) glue job is triggered.  The controller will wait for its completion using the *testGlueJob* function. If the job completes successfully, the DynamoDB table will be updated with the *newIncrementalFile* of the file which was processed.
+In the final step, the controller determines if any incremental files need to be processed by comparing the *lastIncrementalFile* stored in the DynamoDB table with the *newIncrementalFile* retrieved from S3.  If those two values are different it is determined that there are incremental files and the [LoadIncremental](#LoadIncremental) glue job is triggered.  The controller will wait for its completion using the *testGlueJob* function. If the job completes successfully, the DynamoDB table will be updated with the *newIncrementalFile*.
 ```python
     loadIncremental = False
     newIncrementalFile = path + '0.csv'
@@ -199,7 +199,7 @@ inputfile = spark.read.parquet(s3_inputpath+"/2*.parquet")
 inputfile.filter(input_file_name() > last_file)
 inputfile.filter(input_file_name() <= curr_file)
 ```
-Next, the process will determine if a primary key has been set in the DynamoDB table.  If it has been set, the change detection process will need to be implemented.  Otherwise, all records marked for insert (where the *Op* = 'I') will be prepped to be written.
+Next, the process will determine if a primary key has been set in the DynamoDB table.  If it has been set, the change detection process will be executed.  Otherwise, all records marked for insert (where the *Op* = 'I') will be prepped to be written.
 ```python
 if primary_keys == "null":
     output = inputfile.filter(inputfile.Op=='I')
@@ -208,10 +208,11 @@ if primary_keys == "null":
       primaryKeys = primary_keys.split(",")
 ```
 To process the changed records the process will de-dup the input records as well as determine the impacted data lake files.
+
 First, a few metadata fields are added to the input data and the already loaded data:
-* sortpath - For already loaded data, this is set to "0" to ensure that newly loaded data with the same primary key will override it.  For new data this is the filename generated by DMS.
+* sortpath - For already loaded data, this is set to "0" to ensure that newly loaded data with the same primary key will override it.  For new data this is the filename generated by DMS which will have a higher sort order than "0".
 * filepath - For already loaded data, this is the file name of the data lake file.  For new data this is the filename generated by DMS.
-* rownum - This is the relative rownumber of each primary key. For already loaded data, this will always be '1' as there should always be only 1 record for each primary key.  For new data data, this will be a value from 1-to-N for each primary key.  In the case when there are multiple operations on the same primary key, the latest operation will have the greatest rownum value.
+* rownum - This is the relative rownumber of each primary key. For already loaded data, this will always be '1' as there should always be only 1 record for each primary key.  For new data data, this will be a value from 1-to-N for each operation against a primary key.  In the case when there are multiple operations on the same primary key, the latest operation will have the greatest rownum value.
 
 ```python    
     windowRow = Window.partitionBy(primaryKeys).orderBy(desc("sortpath"))
@@ -219,7 +220,7 @@ First, a few metadata fields are added to the input data and the already loaded 
     target = spark.read.parquet(s3_outputpath).withColumn("sortpath", lit("0")).withColumn("filepath",input_file_name()).withColumn("rownum", lit(1))
     input = inputfile.withColumn("sortpath", input_file_name()).withColumn("filepath",input_file_name()).withColumn("rownum", row_number().over(windowRow))
 ```
-To determine which data lake files will be impacted, the input data is joined to the target data and  a distinct list of files is captured.  
+To determine which data lake files will be impacted, the input data is joined to the target data and a distinct list of files is captured.  
 ```python
     files = target.join(inputfile, primaryKeys, 'inner').select(col("filepath").alias("filepath1")).distinct()
 ```
@@ -366,7 +367,12 @@ call loadorders(1246, '2018-12-13');
 call loadorders(723, '2018-11-28');
 ```
 ### Incremental Load Script
-Before proceeding with the incremental load, ensure that your initial data has arrived in the Data Lake.  By default the solution will run on an hourly basis on the 00 minute.  To change the load frequency or minute, modify the **[Glue Trigger](https://console.aws.amazon.com/glue/home?#etl:tab=triggers)**.  Once the seed data has been loaded, execute the following script in the MySQL database to simulate changed data.
+Before proceeding with the incremental load, ensure that 
+1. The initial data has arrived in the DMS bucket.
+1. You have configured your DynamoDB table to set the appropriate ActiveFlag, PrimaryKey and PartitionKey values. 
+1. The initial data has arrived in the LAKE bucket.  Note: By default the solution will run on an hourly basis on the 00 minute.  To change the load frequency or minute, modify the **[Glue Trigger](https://console.aws.amazon.com/glue/home?#etl:tab=triggers)**.  
+
+Once the seed data has been loaded, execute the following script in the MySQL database to simulate changed data.
 ```sql
 update product set name = 'Sample Product', dept = 'Sample Dept', category = 'Sample Category' where id = 1001;
 delete from product where id = 1002;
@@ -374,4 +380,4 @@ call loadorders(1345, current_date);
 insert into store values(1009, '125 Technology Dr.', 'Irvine', 'CA', 'US', '92618');
 ```
 
-Once DMS has processed these changes, you will see new incremental files for store, product, and productorder.  On the next execution of the Glue job, you will see new and updated files in your data lake.
+Once DMS has processed these changes, you will see new incremental files for store, product, and productorder in the DMS bucket.  On the next execution of the Glue job, you will see new and updated files in the LAKE bucket.
