@@ -84,11 +84,14 @@ Resources:
                   - dms:StartReplicationTask
                   - dms:TestConnection
                   - dms:StopReplicationTask
-                Resource:
-                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/DMSCDC_*'
-                  - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:DMSCDC_*'
-                  - !Sub 'arn:aws:iam::${AWS::AccountId}:role/DMSCDC_*'
-                  - !Sub 'arn:aws:dms:${AWS::Region}:${AWS::AccountId}:*:*'
+                Resource:                
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/DMSCDC_Controller'
+                  - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:DMSCDC_InitController'
+                  - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:DMSCDC_InitDMS'
+                  - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:DMSCDC_ImportGlueScript'
+                  - !Sub 'arn:aws:iam::${AWS::AccountId}:role/DMSCDC_ExecutionRole'
+                  - !Sub 'arn:aws:dms:${AWS::Region}:${AWS::AccountId}:endpoint:*'
+                  - !Sub 'arn:aws:dms:${AWS::Region}:${AWS::AccountId}:task:*'
               -
                 Effect: Allow
                 Action:
