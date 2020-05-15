@@ -268,10 +268,10 @@ In this example, assume we have launched an *RDS* database of type *MySQL*.  Aft
 ### Initial Load Script
 #### Create Table Script
 ```sql
-create schema sampledb;
+create schema if not exists sampledb;
 use sampledb;
 
-drop table store;
+drop table if exists store;
 create table store(
 id int,
 address1 varchar(1024),
@@ -280,7 +280,7 @@ state varchar(2),
 countrycode varchar(2),
 postcode varchar(10));
 
-drop table product;
+drop table if exists product;
 create table product(
 id int ,
 name varchar(255),
@@ -288,7 +288,7 @@ dept varchar(100),
 category varchar(100),
 price decimal(10,2));
 
-drop table productorder;
+drop table if exists productorder;
 create table productorder (
 id int NOT NULL AUTO_INCREMENT,
 productid int,
