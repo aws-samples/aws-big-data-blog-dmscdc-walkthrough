@@ -18,32 +18,36 @@ s3conn = boto3.client('s3')
 
 
 def testGlueJob(jobId, count, sec, jobName):
-    i = 0
-    while i < count:
-        response = glue.get_job_run(JobName=jobName, RunId=jobId)
-        status = response['JobRun']['JobRunState']
-        if status == 'SUCCEEDED':
-            return 1
-        elif (status == 'RUNNING' or status == 'STARTING' or status == 'STOPPING'):
-            time.sleep(sec)
-            i+=1
-        else:
-            return 0
-        if i == count:
-            return 0
+  i = 0
+  while i < count:
+    response = glue.get_job_run(JobName=jobName, RunId=jobId)
+    status = response['JobRun']['JobRunState']
+    if status == 'SUCCEEDED':
+      return 1
+    elif (status == 'RUNNING' or status == 'STARTING' or status == 'STOPPING'):
+      time.sleep(sec)
+      i+=1
+    else:
+      return 0
+    if i == count:
+      return 0
 
 def recursiveTraverseFolders(bucket, prefix):
   print('Checking prefix: '+prefix)
+  # Get child folders under prefix
   folders = s3conn.list_objects(Bucket=bucket, Prefix=prefix, Delimiter='/').get('CommonPrefixes')
   if isinstance(folders, list):
+    # This prefix has child folders
     for folder in folders:
       childPrefix = folder['Prefix']
+      # Get child folders for each child of prefix by recursively calling this function
       hasChildFolders = recursiveTraverseFolders(bucket, childPrefix)
       if not hasChildFolders:
+        # This folder has no child folders, meaning it is a table with data files
         print('Processing folder: '+folder['Prefix'])
         processFolder(folder, prefix)
-    return True
-  return False
+    return True # indicate that this prefix has child folders, therefore is not a table folder
+  return False # indicate that this prefix does not have child folders, therefore is a table folder
 
 def processFolder(folder, prefix):
     full_folder = folder['Prefix']
@@ -108,9 +112,9 @@ def processFolder(folder, prefix):
             loadInitial = True
             lastFullLoadDate = datetime.datetime.strftime(s3FileTS,'%Y-%m-%d %H:%M:%S')
           else:
-            print('Intial files already processed.')
+            print('Initial file already processed.')
       else:
-          print('No initial files to process.')
+          print('No initial file to process.')
 
       #Call Initial Glue Job for this source
       if loadInitial:
@@ -177,17 +181,20 @@ def processFolder(folder, prefix):
     else:
     	print("Load is not active--file processing skipped. Update dynamoDB.")
 
-#Required Parameters
+
+# Get supplied Glue job parameters
 args = getResolvedOptions(sys.argv, [
   'prefix',
   'out_prefix',
   'bucket',
   'out_bucket'])
 
+# Assign parameters to local variables
 prefix = args['prefix']
 out_prefix = args['out_prefix']
 bucket = args['bucket']
 out_bucket = args['out_bucket']
 out_path = out_bucket + '/' + out_prefix
 
+# Begin processing
 recursiveTraverseFolders(bucket, prefix)

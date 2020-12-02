@@ -19,32 +19,65 @@ This Github project describes in detail the Glue code components used in the blo
 This solution uses a Python shell job for the Controller. The controller will run each time the workflow is triggered but the LoadInitial and LoadIncremental are only executed as needed.
 
 ### Controller
-The controller job will leverage the state table stored in DynamoDB and compare the state with the files in S3.  It will determine which tables/files need to be processed.
+The controller job will leverage the state table stored in DynamoDB and compare the state with the files in S3.  It will determine which tables/files need to be processed. 
 
-The first step in the processing is to determine the *folders* which are located in DMS raw location and construct an *item* object representing the default values for the *folder*.  Each *folder* represents a table in your source database which will have changes streamed into S3.  
+DMS writes table data into *folders* inside the S3 bucket. Depending on the structure of your source database and your DMS task configuration, the table folders may be nested underneath schema folders in the raw DMS S3 bucket. To traverse the folder structure we use a recursive function that navigates the folders and processes each table folder.
+
+We begin by calling the recursive function with the `bucket` and `prefix` input parameters, which are the same as the `DMSBucket` and `DMSFolder` parameters supplied to the CloudFormation stack created with the `DMSCDC_CloudTemplate_Source.yaml` template.
 ```python
-#get the list of table folders
-s3_input = 's3://'+bucket+'/'+prefix
-url = urlparse.urlparse(s3_input)
-folders = s3conn.list_objects(Bucket=bucket, Prefix=prefix, Delimiter='/').get('CommonPrefixes')
+# Get supplied Glue job parameters
+args = getResolvedOptions(sys.argv, [
+  'prefix',
+  'out_prefix',
+  'bucket',
+  'out_bucket'])
 
-index = 0
-max = len(folders)
+# Assign parameters to local variables
+prefix = args['prefix']
+out_prefix = args['out_prefix']
+bucket = args['bucket']
+out_bucket = args['out_bucket']
+out_path = out_bucket + '/' + out_prefix
 
-for folder in folders:
-    full_folder = folder['Prefix']
-    folder = full_folder[len(prefix):]
-    path = bucket + '/' + full_folder
-    item = {
-        'path': {'S':path},
-        'bucket': {'S':bucket},
-        'prefix': {'S':prefix},
-        'folder': {'S':folder},
-        'PrimaryKey': {'S':'null'},
-        'PartitionKey': {'S':'null'},
-        'LastFullLoadDate': {'S':'1900-01-01 00:00:00'},
-        'LastIncrementalFile': {'S':path + '0.parquet'},
-        'ActiveFlag': {'S':'false'}}
+# Begin processing
+recursiveTraverseFolders(bucket, prefix)
+
+def recursiveTraverseFolders(bucket, prefix):
+  print('Checking prefix: '+prefix)
+  # Get child folders under prefix
+  folders = s3conn.list_objects(Bucket=bucket, Prefix=prefix, Delimiter='/').get('CommonPrefixes')
+  if isinstance(folders, list):
+    # This prefix has child folders
+    for folder in folders:
+      childPrefix = folder['Prefix']
+      # Get child folders for each child of prefix by recursively calling this function
+      hasChildFolders = recursiveTraverseFolders(bucket, childPrefix)
+      if not hasChildFolders:
+        # This folder has no child folders, meaning it is a table with data files
+        print('Processing folder: '+folder['Prefix'])
+        processFolder(folder, prefix)
+    return True # indicate that this prefix has child folders, therefore is not a table folder
+  return False # indicate that this prefix does not have child folders, therefore is a table folder
+```
+
+For each table folder, we call `processFolder()` which contains all of the logic for processing the table.
+
+The first step within `processFolder()` is to create a DynamoDB item with default values for the table.
+
+```python
+full_folder = folder['Prefix']
+folder = full_folder[len(prefix):]
+path = bucket + '/' + full_folder
+item = {
+  'path': {'S':path},
+  'bucket': {'S':bucket},
+  'prefix': {'S':prefix},
+  'folder': {'S':folder},
+  'PrimaryKey': {'S':'null'},
+  'PartitionKey': {'S':'null'},
+  'LastFullLoadDate': {'S':'1900-01-01 00:00:00'},
+  'LastIncrementalFile': {'S':path + '0.parquet'},
+  'ActiveFlag': {'S':'false'}}
 ```
 
 The next step is to pull the state of each table from the DMSCDC_Controller DynamoDB table.  If the table is not present the table will be created.  If the row is not present the row will be created with the default values set earlier.
@@ -79,94 +112,91 @@ The next step is to pull the state of each table from the DMSCDC_Controller Dyna
     activeFlag = item['ActiveFlag']['S']
     primaryKey = item['PrimaryKey']['S']
 ```
+If the DynamoDB table has the `ActiveFlag != 'true'`, the remainder of the processing logic for this table will be skipped.  This is to ensure that a user has reviewed the table and set appropriate keys. If the PrimaryKey has been set, the incremental load will conduct change detection logic.  If the `PrimaryKey` DynamoDB field has NOT been set, incremental load will only load rows marked for insert. If the `PartitionKey` DynamoDB field has been set, the Spark job will partition the data before it is written. 
 
 In the next step, the controller determines if the initial file needs to be processed by comparing the timestamp of the initial load file stored in the DynamoDB table with the timestamp retrieved from S3.  If it is determined that the initial file should be processed the [LoadInitial](#LoadInitial) glue job is triggered.  The controller will wait for its completion using the *testGlueJob* function. If the job completes successfully, the DynamoDB table will be updated with the timestamp of the file which was processed.
 
-Note: if the DynamoDB table has the ActiveFlag != 'true', this table will be skipped.  This is to ensure that a user has reviewed the table and set appropriate keys. If the PrimaryKey has been set, the incremental load will conduct change detection logic.  If the PrimaryKey has NOT been set, incremental load will only load rows marked for insert. If the PartitionKey has been set, the Spark job will partition the data before it is written.  
 ```python
-    loadInitial = False
-    #determine if need to run initial --> Run Initial --> Update DDB
-    initialfiles = s3conn.list_objects(Bucket=bucket, Prefix=full_folder+'LOAD').get('Contents')
-    if activeFlag == 'true' :
-      if initialfiles is not None :
-          s3FileTS = initialfiles[0]['LastModified'].replace(tzinfo=None)
-          ddbFileTS = datetime.datetime.strptime(lastFullLoadDate, '%Y-%m-%d %H:%M:%S')
-          if s3FileTS > ddbFileTS:
-              message='Starting to process Initial file.'
-              loadInitial = True
-              lastFullLoadDate = datetime.datetime.strftime(s3FileTS,'%Y-%m-%d %H:%M:%S')
-          else:
-              message='Intial files already processed.'
-      else:
-          message='No initial files to process.'
-    else:
-      message='Load is not active.  Update DynamoDB.'
-    print(message)
+#determine if need to run initial --> Run Initial --> Update DDB
+loadInitial = False
 
-    #Call Initial Glue Job for this source
-    if loadInitial:
-        response = glue.start_job_run(
-            JobName='DMSCDC_LoadInitial',
-            Arguments={
-                '--bucket':bucket,
-                '--prefix':prefix,
-                '--folder':folder,
-                '--out_path':out_path,
-                '--partitionKey':partitionKey})
+initialfiles = s3conn.list_objects(Bucket=bucket, Prefix=full_folder+'LOAD').get('Contents')
+if initialfiles is not None :
+  s3FileTS = initialfiles[0]['LastModified'].replace(tzinfo=None)
+  ddbFileTS = datetime.datetime.strptime(lastFullLoadDate, '%Y-%m-%d %H:%M:%S')
+  if s3FileTS > ddbFileTS:
+    print('Starting to process Initial file.')
+    loadInitial = True
+    lastFullLoadDate = datetime.datetime.strftime(s3FileTS,'%Y-%m-%d %H:%M:%S')
+  else:
+    print('Intial files already processed.')
+else:
+  print('No initial files to process.')
 
-        #Wait for execution complete, timeout in 20*30=900 secs, if successful, update ddb
-        if testGlueJob(response['JobRunId'], 30, 30, 'DMSCDC_LoadInitial') != 1:
-            message = 'Error during Controller execution'
-            raise ValueError(message)
-        else:
-            ddbconn.update_item(
-                TableName='DMSCDC_Controller',
-                Key={"path": {"S":path}},
-                AttributeUpdates={"LastFullLoadDate": {"Value": {"S": lastFullLoadDate}}})
+#Call Initial Glue Job for this source
+if loadInitial:
+response = glue.start_job_run(
+  JobName='DMSCDC_LoadInitial',
+  Arguments={
+    '--bucket':bucket,
+    '--prefix':prefix,
+    '--folder':folder,
+    '--out_path':out_path,
+    '--partitionKey':partitionKey})
+
+#Wait for execution complete, timeout in 20*30=900 secs, if successful, update ddb
+if testGlueJob(response['JobRunId'], 30, 30, 'DMSCDC_LoadInitial') != 1:
+  message = 'Error during Controller execution'
+  raise ValueError(message)
+else:
+  ddbconn.update_item(
+  TableName='DMSCDC_Controller',
+  Key={"path": {"S":path}},
+  AttributeUpdates={"LastFullLoadDate": {"Value": {"S": lastFullLoadDate}}})
 ```
-In the final step, the controller determines if any incremental files need to be processed by comparing the *lastIncrementalFile* stored in the DynamoDB table with the *newIncrementalFile* retrieved from S3.  If those two values are different it is determined that there are incremental files and the [LoadIncremental](#LoadIncremental) glue job is triggered.  The controller will wait for its completion using the *testGlueJob* function. If the job completes successfully, the DynamoDB table will be updated with the *newIncrementalFile*.
+In the final step, the controller determines if any incremental files need to be processed by comparing the `LastIncrementalFile` stored in the DynamoDB table with the `newIncrementalFile` retrieved from S3.  If those two values are different it is determined that there are incremental files and the [LoadIncremental](#LoadIncremental) glue job is triggered.  The controller will wait for its completion using the `testGlueJob()` function. If the job completes successfully, the DynamoDB table will be updated with `newIncrementalFile`.
 ```python
-    loadIncremental = False
-    newIncrementalFile = path + '0.csv'
+#determine if need to run incremental --> Run incremental --> Update DDB
+loadIncremental = False
+newIncrementalFile = path + '0.parquet'
 
-    if activeFlag == 'true':
-      incrementalFiles = s3conn.list_objects(Bucket=bucket, Prefix=full_folder+'2').get('Contents')
-      if incrementalFiles is not None:
-          filecount = len(incrementalFiles)
-          newIncrementalFile = bucket + '/' + incrementalFiles[filecount-1]['Key']
-          if newIncrementalFile != lastIncrementalFile:
-              loadIncremental = True
-              message = "Starting to process incremental files"
-          else:
-              message = "Incremental files already processed."
-      else:
-          message = "No incremental files to process."
-    else:
-      message = "Load is not active.  Update DynamoDB."
-    print(message)
+#Get the latest incremental file
+incrementalFiles = s3conn.list_objects(Bucket=bucket, Prefix=full_folder+'2').get('Contents')
+if incrementalFiles is not None:
+  filecount = len(incrementalFiles)
+  newIncrementalFile = bucket + '/' + incrementalFiles[filecount-1]['Key']
+  if newIncrementalFile != lastIncrementalFile:
+    loadIncremental = True
+    print("Starting to process incremental files")
+  else:
+    print("Incremental files already processed.")
+else:
+  print("No incremental files to process.")
 
-    if loadIncremental:
-        response = glue.start_job_run(
-            JobName='DMSCDC_LoadIncremental',
-            Arguments={
-                '--bucket':bucket,
-                '--prefix':prefix,
-                '--folder':folder,
-                '--out_path':out_path,
-                '--partitionKey':partitionKey,
-                '--lastIncrementalFile' : lastIncrementalFile,
-                '--newIncrementalFile' : newIncrementalFile,
-                '--primaryKey' : primaryKey
-                })
+#Call Incremental Glue Job for this source
+if loadIncremental:
+  response = glue.start_job_run(
+    JobName='DMSCDC_LoadIncremental',
+    Arguments={
+      '--bucket':bucket,
+      '--prefix':prefix,
+      '--folder':folder,
+      '--out_path':out_path,
+      '--partitionKey':partitionKey,
+      '--lastIncrementalFile' : lastIncrementalFile,
+      '--newIncrementalFile' : newIncrementalFile,
+      '--primaryKey' : primaryKey
+    })
 
-        if testGlueJob(response['JobRunId'], 30, 30, 'DMSCDC_LoadIncremental') != 1:
-            message = 'Error during Controller execution'
-            raise ValueError(message)
-        else:
-            ddbconn.update_item(
-                TableName='DMSCDC_Controller',
-                Key={"path": {"S":path}},
-                AttributeUpdates={"LastIncrementalFile": {"Value": {"S": newIncrementalFile}}})
+  #Wait for execution complete, timeout in 20*30=900 secs, if successful, update ddb
+  if testGlueJob(response['JobRunId'], 30, 30, 'DMSCDC_LoadIncremental') != 1:
+    message = 'Error during Controller execution'
+    raise ValueError(message)
+  else:
+    ddbconn.update_item(
+      TableName='DMSCDC_Controller',
+      Key={"path": {"S":path}},
+      AttributeUpdates={"LastIncrementalFile": {"Value": {"S": newIncrementalFile}}})
 ```
 
 ### LoadInitial
@@ -261,8 +291,8 @@ In order for a DB to be a candidate for DMS as a source it needs to meet certain
 In this example, assume we have launched an *RDS* database of type *MySQL*.  After the database has been launched, perform the following actions:
 1. Create a new [Parameter Group](https://console.aws.amazon.com/rds/home?#parameter-groups:) based on the version of MySQL which you are using.
 1. Modify the parameter group parameters setting the following
- * binlog_format: "ROW"
- * binlog_checksum: "NONE"
+   * `binlog_format`: `ROW`
+   * `binlog_checksum`: `NONE`
 1. Modify the database to use the newly created parameter group.
 
 ### Initial Load Script
