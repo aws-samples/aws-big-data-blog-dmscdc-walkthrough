@@ -212,6 +212,7 @@ Resources:
           def handler(event, context):
             logger.info(json.dumps(event))
             if event['RequestType'] != 'Create':
+                logger.info('No action necessary')
                 cfnresponse.send(event, context, cfnresponse.SUCCESS, {'Data': 'NA'})
             else:
                 try:
@@ -244,7 +245,7 @@ Resources:
                       logger.info(message)
                       cfnresponse.send(event, context, cfnresponse.SUCCESS, {'Data': message})
                 except Exception as e:
-                  message = 'Glue Job Issue: ' + e.message
+                  message = 'Glue Job Issue: ' + str(e)
                   logger.info(message)
                   cfnresponse.send(event, context, cfnresponse.FAILED, {'Data': message})
       Handler: index.handler
@@ -318,7 +319,7 @@ Resources:
                   s3.Bucket(dmsBucket).objects.all().delete()
                   logger.info('Task Stopped, Bucket Emptied')
                 except Exception as e:
-                  message = 'Issue with Stopping Task or Emptying Bucket:' + e.message
+                  message = 'Issue with Stopping Task or Emptying Bucket:' + str(e)
                   logger.error(message)
                 cfnresponse.send(event, context, cfnresponse.SUCCESS, {'Data': 'NA'})
             else:
@@ -348,7 +349,7 @@ Resources:
                       cfnresponse.send(event, context, cfnresponse.FAILED, {'Data': message})
 
                 except Exception as e:
-                  message = 'DMS Endpoint Issue: ' + e.message
+                  message = 'DMS Endpoint Issue: ' + str(e)
                   logger.error(message)
                   cfnresponse.send(event, context, cfnresponse.FAILED, {'Data': message})
 
@@ -359,17 +360,17 @@ Resources:
                       StartReplicationTaskType='start-replication')
                     if testRepTask(taskArn, 10) != 1:
                       message = 'Error during DMS execution'
-                      logger.error('message')
+                      logger.error(message)
                       cfnresponse.send(event, context, cfnresponse.FAILED, {'Data': message})
                     else:
                       message = 'DMS Execution Successful'
-                      logger.info('message')
+                      logger.info(message)
                       cfnresponse.send(event, context, cfnresponse.SUCCESS, {'Data': message})
                 except Exception as e:
-                  message = 'DMS Task Issue: ' + e.message
-                  logger.error('message')
+                  message = 'DMS Task Issue: ' + str(e)
+                  logger.error(message)
                   cfnresponse.send(event, context, cfnresponse.FAILED, {'Data': message})
-
+                  
       Handler: index.handler
       Role:
         Fn::GetAtt: [ExecutionRole, Arn]

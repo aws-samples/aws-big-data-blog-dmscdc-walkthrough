@@ -1,30 +1,8 @@
 AWSTemplateFormatVersion: 2010-09-09
-Conditions:
-  IsDatabase:
-    Fn::Or:
-      - Fn::Equals:
-          - Ref: DBEngine
-          - db2
-      - Fn::Equals:
-          - Ref: DBEngine
-          - azuredb
-      - Fn::Equals:
-          - Ref: DBEngine
-          - sqlserver
-      - Fn::Equals:
-          - Ref: DBEngine
-          - oracle
-      - Fn::Equals:
-          - Ref: DBEngine
-          - postgres
-      - Fn::Equals:
-          - Ref: DBEngine
-          - sybase
 Parameters:
   DBEngine:
     Description: Choose the source DB engine to stream changes.
     Type: String
-    Default: mysql
     AllowedValues:
       - mysql
       - oracle
@@ -59,24 +37,24 @@ Parameters:
     Type: String
     Default: "%"
     AllowedPattern: ^[a-zA-Z0-9-_%]*$
-    ConstraintDescription: Must only contain uppe/lower-case letters, numbers, -, _, or %.
+    ConstraintDescription: Must only contain upper/lower-case letters, numbers, -, _, or %.
   DMSSchemaFilter:
     Description: Choose the DMS schema filter criteria.
     Type: String
-    Default: ""
-    AllowedPattern: ^[a-zA-Z0-9_-]*$
-    ConstraintDescription: Must only contain uppe/lower-case letters, numbers, -, or _.
+    Default: "%"
+    AllowedPattern: ^[a-zA-Z0-9-_%]*$
+    ConstraintDescription: Must only contain upper/lower-case letters, numbers, -, _, or %.
   DMSBucket:
     Description: Name of the Bucket to land the DMS data.
     Type: String
   DMSFolder:
-    Description: (Optional) Prefix within bucket to store DMS data.
+    Description: Prefix within bucket to store DMS data. Please omit the trailing /
     Type: String
   LakeBucket:
     Description: Name of the Bucket to land the processed data.
     Type: String
   LakeFolder:
-    Description: (Optional) Prefix within bucket to store processed data.
+    Description: Prefix within bucket to store processed data. Please omit the trailing /
     Type: String
   LakeDBName:
     Description: Name to be used in analytical tools such as Athena and Redshift to reference these tables within the data lake.
@@ -136,10 +114,7 @@ Resources:
       Password:
         Ref: DBPassword
       DatabaseName:
-        Fn::If:
-          - IsDatabase
-          - Ref: DBName
-          - Ref: AWS::NoValue
+        Ref: DBName
   DMSRawBucket:
     Type: AWS::S3::Bucket
     Properties:
@@ -150,7 +125,7 @@ Resources:
     Properties:
         EndpointType: target
         EngineName: s3
-        ExtraConnectionAttributes : "dataFormat=parquet"
+        ExtraConnectionAttributes : "dataFormat=parquet;parquetTimestampInMillisecond=true"
         S3Settings :
             BucketFolder:
                 Ref: DMSFolder
@@ -195,11 +170,12 @@ Resources:
           Arguments:
             '--bucket': !Ref DMSBucket
             '--prefix': !Sub
-              - '${prefix}${schema}/'
+              - '${prefix}/'
               - prefix: !Ref DMSFolder
-                schema: !Ref DMSSchemaFilter
             '--out_bucket': !Ref LakeBucket
-            '--out_prefix': !Ref LakeFolder
+            '--out_prefix': !Sub
+              - '${out_prefix}/'
+              - out_prefix: !Ref LakeFolder
   GlueCrawler:
     Type: AWS::Glue::Crawler
     Properties:
@@ -238,8 +214,8 @@ Resources:
       ServiceToken: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:DMSCDC_InitController'
       dmsBucket: !Ref DMSBucket
       dmsPath: !Sub
-        - "${prefix}${schema}/"
-        - { prefix: !Ref DMSFolder,schema: !Ref DMSSchemaFilter}
+        - "${prefix}/"
+        - { prefix: !Ref DMSFolder}
       lakeBucket: !Ref LakeBucket
       lakePath: !Ref LakeFolder
       lakeDBName: !Ref LakeDBName

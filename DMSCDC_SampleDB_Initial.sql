@@ -1,7 +1,7 @@
-create schema sampledb;
+create schema if not exists sampledb;
 use sampledb;
 
-drop table store;
+drop table if exists store;
 create table store(
 id int,
 address1 varchar(1024),
@@ -20,7 +20,7 @@ insert into store (id, address1, city, state, countrycode, postcode) values
 (1007, '2034 Fayetteville Rd','Van Buren','AR','US','72956'),
 (1008, '3640 W. Anthem Way','Anthem','AZ','US','85086');
 
-drop table product;
+drop table if exists product;
 create table product(
 id int ,
 name varchar(255),
@@ -56,7 +56,7 @@ insert into product (id, name, dept, category, price) values
 (1025,'LG Electronics 55UK6300PUE 55-Inch 4K Ultra HD Smart LED TV (2018 Model)','Electronics','TV',496);
 
 
-drop table productorder;
+drop table if exists productorder;
 create table productorder (
 id int NOT NULL AUTO_INCREMENT,
 productid int,
@@ -81,9 +81,9 @@ BEGIN
       ITERATE helper;
     ELSE
       LEAVE  helper;
-    END IF;
+    END IF;     
   END LOOP;
-END
+END;
 
 truncate table productorder;
 call loadorders(1010, '2018-11-27');
