@@ -367,9 +367,9 @@ call loadorders(1246, '2018-12-13');
 call loadorders(723, '2018-11-28');
 ```
 ### Incremental Load Script
-Before proceeding with the incremental load, ensure that 
+Before proceeding with the incremental load, ensure that
 1. The initial data has arrived in the DMS bucket.
-1. You have configured your DynamoDB table to set the appropriate ActiveFlag, PrimaryKey and PartitionKey values. 
+1. You have configured your DynamoDB table to set the appropriate ActiveFlag, PrimaryKey and PartitionKey values.
 1. The initial data has arrived in the LAKE bucket.  Note: By default the solution will run on an hourly basis on the 00 minute.  To change the load frequency or minute, modify the **[Glue Trigger](https://console.aws.amazon.com/glue/home?#etl:tab=triggers)**.  
 
 Once the seed data has been loaded, execute the following script in the MySQL database to simulate changed data.
@@ -380,4 +380,4 @@ call loadorders(1345, current_date);
 insert into store values(1009, '125 Technology Dr.', 'Irvine', 'CA', 'US', '92618');
 ```
 
-Once DMS has processed these changes, you will see new incremental files for store, product, and productorder in the DMS bucket.  On the next execution of the Glue job, you will see new and updated files in the LAKE bucket.
+Once DMS has processed these changes, you will see new incremental files for store, product, and productorder in the DMS bucket.  On the next execution of the Glue job, you will see new and updated files in the LAKE bucket. Test.
