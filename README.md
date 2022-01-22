@@ -287,7 +287,7 @@ Below is a sample MySQL database you can build and use in conjunction with this 
 ### Source DB Setup
 In order for a DB to be a candidate for DMS as a source it needs to meet certain [requirements](https://docs.aws.amazon.com/dms/latest/userguide/CHAP_Source.html) whether it's managed through Amazon via RDS or if it's an EC2 or on-premise installation.  Launch the following cloud formation stack to deploy a MySQL DB that has been pre-configured to meet these requirements and which is *pre-loaded* with the [initial load script](DMSCDC_SampleDB_Initial.sql).  Be sure to choose the *same VPC/Subnet/Security Group* as your DMS Replication Instance to ensure they have network connectivity.
 
-[![](https://console.aws.amazon.com/cloudformation/home?#/stacks/new?stackName=DMSCDCSampleDB&templateURL=https://s3-us-west-2.amazonaws.com/dmscdc-files/DMSCDC_SampleDB.yaml)](launch-stack.svg)
+[![](launch-stack.svg)](https://console.aws.amazon.com/cloudformation/home?#/stacks/new?stackName=DMSCDCSampleDB&templateURL=https://s3-us-west-2.amazonaws.com/dmscdc-files/DMSCDC_SampleDB.yaml)
 
 ### Incremental Load Script
 Before proceeding with the incremental load, ensure that
