@@ -1,8 +1,7 @@
-create schema sampledb;
-use sampledb;
+create schema if not exists sampledb;
 
-drop table store;
-create table store(
+drop table if exists sampledb.store;
+create table sampledb.store(
 id int,
 address1 varchar(1024),
 city varchar(255),
@@ -10,7 +9,7 @@ state varchar(2),
 countrycode varchar(2),
 postcode varchar(10));
 
-insert into store (id, address1, city, state, countrycode, postcode) values
+insert into sampledb.store (id, address1, city, state, countrycode, postcode) values
 (1001, '320 W. 100th Ave, 100, Southgate Shopping Ctr - Anchorage','Anchorage','AK','US','99515'),
 (1002, '1005 E Dimond Blvd','Anchorage','AK','US','99515'),
 (1003, '1771 East Parks Hwy, Unit #4','Wasilla','AK','US','99654'),
@@ -20,15 +19,15 @@ insert into store (id, address1, city, state, countrycode, postcode) values
 (1007, '2034 Fayetteville Rd','Van Buren','AR','US','72956'),
 (1008, '3640 W. Anthem Way','Anthem','AZ','US','85086');
 
-drop table product;
-create table product(
+drop table if exists sampledb.product;
+create table sampledb.product(
 id int ,
 name varchar(255),
 dept varchar(100),
 category varchar(100),
 price decimal(10,2));
 
-insert into product (id, name, dept, category, price) values
+insert into sampledb.product (id, name, dept, category, price) values
 (1001,'Fire 7','Amazon Devices','Fire Tablets',39),
 (1002,'Fire HD 8','Amazon Devices','Fire Tablets',89),
 (1003,'Fire HD 10','Amazon Devices','Fire Tablets',119),
@@ -56,38 +55,39 @@ insert into product (id, name, dept, category, price) values
 (1025,'LG Electronics 55UK6300PUE 55-Inch 4K Ultra HD Smart LED TV (2018 Model)','Electronics','TV',496);
 
 
-drop table productorder;
-create table productorder (
-id int NOT NULL AUTO_INCREMENT,
+drop table if exists sampledb.productorder;
+create table sampledb.productorder (
+id int NOT NULL,
 productid int,
 storeid int,
 qty int,
 soldprice decimal(10,2),
-create_dt date,
-PRIMARY KEY (id));
+create_dt date);
 
-
-CREATE PROCEDURE loadorders (
+DROP PROCEDURE IF EXISTS sampledb.loadorders;
+CREATE PROCEDURE sampledb.loadorders (
   IN OrderCnt int,
   IN create_dt date
 )
 BEGIN
   DECLARE i INT DEFAULT 0;
+  DECLARE maxid INT Default 0;
+  SELECT coalesce(max(id),0) INTO maxid from sampledb.productorder;
   helper: LOOP
     IF i<OrderCnt THEN
-      INSERT INTO productorder(productid, storeid, qty, soldprice, create_dt)
-         values (1000+ceil(rand()*25), 1000+ceil(rand()*8), ceil(rand()*10), rand()*100, create_dt) ;
       SET i = i+1;
+      INSERT INTO sampledb.productorder(id, productid, storeid, qty, soldprice, create_dt)
+         values (maxid+i,1000+ceil(rand()*25), 1000+ceil(rand()*8), ceil(rand()*10), rand()*100, create_dt) ;
       ITERATE helper;
     ELSE
       LEAVE  helper;
     END IF;
   END LOOP;
-END
+END;
 
-truncate table productorder;
-call loadorders(1010, '2018-11-27');
-call loadorders(1196, '2018-12-03');
-call loadorders(4250, '2018-12-10');
-call loadorders(1246, '2018-12-13');
-call loadorders(723, '2018-11-28');
+truncate table sampledb.productorder;
+call sampledb.loadorders(1010, '2018-11-27');
+call sampledb.loadorders(1196, '2018-12-03');
+call sampledb.loadorders(4250, '2018-12-10');
+call sampledb.loadorders(1246, '2018-12-13');
+call sampledb.loadorders(723, '2018-11-28');

@@ -5,14 +5,16 @@ The AWS Big Data blog post [Load ongoing data lake changes with AWS DMS and AWS 
 
 This Github project describes in detail the Glue code components used in the blog post.   In addition, it includes detailed steps to setup the RDS DB mentioned in the blog post to demonstrate the solution.
 
+> 01/22/2022: This solution was updated to resolve some key bugs and implement certain performance related enhancements. See the [change log](CHANGELOG.md) for more details.
+
 [Glue Jobs](#glue-jobs)
  * [Controller](#controller) - [DMSCDC_Controller.py](./DMSCDC_Controller.py)
+ * [ProcessTable](#processtable) - [DMSCDC_ProcessTable.py](./DMSCDC_ProcessTable.py)
  * [LoadInitial](#loadinitial) - [DMSCDC_LoadInitial.py](./DMSCDC_LoadInitial.py)
  * [LoadIncremental](#loadincremental) - [DMSCDC_LoadIncremental.py](./DMSCDC_LoadIncremental.py)
 
 [Sample Database](#sample-database)
- * [MySQL RDS Settings](#mysql-rds-settings)
- * [Initial Load Script](#initial-load-script) - [DMSCDC_SampleDB_Initial.sql](./DMSCDC_SampleDB_Initial.sql)
+ * [Source DB Setup](#source-db-setup) - [DMSCDC_SampleDB.yaml](./DMSCDC_SampleDB.yaml)
  * [Incremental Load Script](#incremental-load-script) - [DMSCDC_SampleDB_Incremental.sql](./DMSCDC_SampleDB_Incremental.sql)
 
 ## Glue Jobs
@@ -21,30 +23,35 @@ This solution uses a Python shell job for the Controller. The controller will ru
 ### Controller
 The controller job will leverage the state table stored in DynamoDB and compare the state with the files in S3.  It will determine which tables/files need to be processed.
 
-The first step in the processing is to determine the *folders* which are located in DMS raw location and construct an *item* object representing the default values for the *folder*.  Each *folder* represents a table in your source database which will have changes streamed into S3.  
+The first step in the processing is to determine the *schemas* and *tables* which are located in DMS raw location and construct an *item* object representing the default values for the *table*.  
 ```python
 #get the list of table folders
 s3_input = 's3://'+bucket+'/'+prefix
-url = urlparse.urlparse(s3_input)
-folders = s3conn.list_objects(Bucket=bucket, Prefix=prefix, Delimiter='/').get('CommonPrefixes')
+url = urlparse(s3_input)
+schemas = s3conn.list_objects(Bucket=bucket, Prefix=prefix, Delimiter='/').get('CommonPrefixes')
+if schemas is None:
+    logger.error('DMSBucket: '+bucket+' DMSFolder: ' + prefix + ' is empty.  Confirm the source DB has data and the DMS replication task is replicating to this S3 location. Review the documention https://docs.aws.amazon.com/dms/latest/userguide/CHAP_Source.html to ensure the DB is setup for CDC.')
+    sys.exit()
 
 index = 0
-max = len(folders)
-
-for folder in folders:
-    full_folder = folder['Prefix']
-    folder = full_folder[len(prefix):]
-    path = bucket + '/' + full_folder
-    item = {
-        'path': {'S':path},
-        'bucket': {'S':bucket},
-        'prefix': {'S':prefix},
-        'folder': {'S':folder},
-        'PrimaryKey': {'S':'null'},
-        'PartitionKey': {'S':'null'},
-        'LastFullLoadDate': {'S':'1900-01-01 00:00:00'},
-        'LastIncrementalFile': {'S':path + '0.parquet'},
-        'ActiveFlag': {'S':'false'}}
+#get folder metadata
+for schema in schemas:
+    tables = s3conn.list_objects(Bucket=bucket, Prefix=schema['Prefix'], Delimiter='/').get('CommonPrefixes')
+    for table in tables:
+        full_folder = table['Prefix']
+        foldername = full_folder[len(schema['Prefix']):]
+        path = bucket + '/' + full_folder
+        print('Processing table: ' + path)
+        item = {
+            'path': {'S':path},
+            'bucket': {'S':bucket},
+            'prefix': {'S':schema['Prefix']},
+            'folder': {'S':foldername},
+            'PrimaryKey': {'S':'null'},
+            'PartitionKey': {'S':'null'},
+            'LastFullLoadDate': {'S':'1900-01-01 00:00:00'},
+            'LastIncrementalFile': {'S':path + '0.parquet'},
+            'ActiveFlag': {'S':'false'}}
 ```
 
 The next step is to pull the state of each table from the DMSCDC_Controller DynamoDB table.  If the table is not present the table will be created.  If the row is not present the row will be created with the default values set earlier.
@@ -56,7 +63,8 @@ The next step is to pull the state of each table from the DMSCDC_Controller Dyna
             TableName='DMSCDC_Controller',
             KeySchema=[{'AttributeName': 'path','KeyType': 'HASH'}],
             AttributeDefinitions=[{'AttributeName': 'path','AttributeType': 'S'}],
-            ProvisionedThroughput={'ReadCapacityUnits': 1,'WriteCapacityUnits': 1})
+            BillingMode='PAY_PER_REQUEST')
+        time.sleep(10)
 
     try:
         response = ddbconn.get_item(
@@ -72,101 +80,93 @@ The next step is to pull the state of each table from the DMSCDC_Controller Dyna
         ddbconn.put_item(
             TableName='DMSCDC_Controller',
             Item=item)
-
-    partitionKey = item['PartitionKey']['S']
-    lastFullLoadDate = item['LastFullLoadDate']['S']
-    lastIncrementalFile = item['LastIncrementalFile']['S']
-    activeFlag = item['ActiveFlag']['S']
-    primaryKey = item['PrimaryKey']['S']
 ```
 
-In the next step, the controller determines if the initial file needs to be processed by comparing the timestamp of the initial load file stored in the DynamoDB table with the timestamp retrieved from S3.  If it is determined that the initial file should be processed the [LoadInitial](#LoadInitial) glue job is triggered.  The controller will wait for its completion using the *testGlueJob* function. If the job completes successfully, the DynamoDB table will be updated with the timestamp of the file which was processed.
+Next, the controller will start a new python shell job `DMSCDC_ProcessTable` for each table in parallel.  The job will determine if an initial and/or incremental load is needed.
 
-Note: if the DynamoDB table has the ActiveFlag != 'true', this table will be skipped.  This is to ensure that a user has reviewed the table and set appropriate keys. If the PrimaryKey has been set, the incremental load will conduct change detection logic.  If the PrimaryKey has NOT been set, incremental load will only load rows marked for insert. If the PartitionKey has been set, the Spark job will partition the data before it is written.  
+> Note: if the DynamoDB table has the ActiveFlag != 'true', this table will be skipped.  This is to ensure that a user has reviewed the table and set appropriate keys. If the PrimaryKey has been set, the incremental load will conduct change detection logic.  If the PrimaryKey has NOT been set, incremental load will only load rows marked for insert. If the PartitionKey has been set, the Spark job will partition the data before it is written.  
+
 ```python
-    loadInitial = False
-    #determine if need to run initial --> Run Initial --> Update DDB
-    initialfiles = s3conn.list_objects(Bucket=bucket, Prefix=full_folder+'LOAD').get('Contents')
-    if activeFlag == 'true' :
-      if initialfiles is not None :
-          s3FileTS = initialfiles[0]['LastModified'].replace(tzinfo=None)
-          ddbFileTS = datetime.datetime.strptime(lastFullLoadDate, '%Y-%m-%d %H:%M:%S')
-          if s3FileTS > ddbFileTS:
-              message='Starting to process Initial file.'
-              loadInitial = True
-              lastFullLoadDate = datetime.datetime.strftime(s3FileTS,'%Y-%m-%d %H:%M:%S')
-          else:
-              message='Intial files already processed.'
-      else:
-          message='No initial files to process.'
+#determine if need to run incremental --> Run incremental --> Update DDB
+if item['ActiveFlag']['S'] == 'true':
+    logger.warn('starting processTable, args: ' + json.dumps(item))
+    response = glue.start_job_run(JobName='DMSCDC_ProcessTable',Arguments={'--item':json.dumps(item)})
+    logger.debug(json.dumps(response))
+else:
+  logger.error('Load is not active.  Update dynamoDB: ' + full_folder)
+```        
+
+### ProcessTable
+The first step of the `DMSCDCD_ProcessTable` job, is to determine if the initial file needs to be processed by comparing the timestamp of the initial load file stored in the DynamoDB table with the timestamp retrieved from S3.  If it is determined that the initial file should be processed the [LoadInitial](#LoadInitial) glue job is triggered.  The controller will wait for its completion using the `runGlueJob` function. If the job completes successfully, the DynamoDB table will be updated with the timestamp of the file which was processed.
+
+```python
+logger.warn('starting processTable: ' + path)
+loadInitial = False
+#determine if need to run initial --> Run Initial --> Update DDB
+initialfiles = s3conn.list_objects(Bucket=bucket, Prefix=full_folder+'LOAD').get('Contents')
+if initialfiles is not None :
+    s3FileTS = initialfiles[0]['LastModified'].replace(tzinfo=None)
+    ddbFileTS = datetime.datetime.strptime(lastFullLoadDate, '%Y-%m-%d %H:%M:%S')
+    if s3FileTS > ddbFileTS:
+        message='Starting to process Initial file: ' + full_folder
+        loadInitial = True
+        lastFullLoadDate = datetime.datetime.strftime(s3FileTS,'%Y-%m-%d %H:%M:%S')
     else:
-      message='Load is not active.  Update DynamoDB.'
-    print(message)
+      message='Intial files already processed: ' + full_folder
+else:
+  message='No initial files to process: ' + full_folder
+logger.warn(message)
 
-    #Call Initial Glue Job for this source
-    if loadInitial:
-        response = glue.start_job_run(
-            JobName='DMSCDC_LoadInitial',
-            Arguments={
-                '--bucket':bucket,
-                '--prefix':prefix,
-                '--folder':folder,
-                '--out_path':out_path,
-                '--partitionKey':partitionKey})
-
-        #Wait for execution complete, timeout in 20*30=900 secs, if successful, update ddb
-        if testGlueJob(response['JobRunId'], 30, 30, 'DMSCDC_LoadInitial') != 1:
-            message = 'Error during Controller execution'
-            raise ValueError(message)
-        else:
-            ddbconn.update_item(
-                TableName='DMSCDC_Controller',
-                Key={"path": {"S":path}},
-                AttributeUpdates={"LastFullLoadDate": {"Value": {"S": lastFullLoadDate}}})
+#Call Initial Glue Job for this source
+if loadInitial:
+    args={
+        '--bucket':bucket,
+        '--prefix':full_folder,
+        '--folder':folder,
+        '--out_path':out_path,
+        '--partitionKey':partitionKey}
+    if runGlueJob('DMSCDC_LoadInitial',args) != 1:
+        ddbconn.update_item(
+            TableName='DMSCDC_Controller',
+            Key={"path": {"S":path}},
+            AttributeUpdates={"LastFullLoadDate": {"Value": {"S": lastFullLoadDate}}})
 ```
-In the final step, the controller determines if any incremental files need to be processed by comparing the *lastIncrementalFile* stored in the DynamoDB table with the *newIncrementalFile* retrieved from S3.  If those two values are different it is determined that there are incremental files and the [LoadIncremental](#LoadIncremental) glue job is triggered.  The controller will wait for its completion using the *testGlueJob* function. If the job completes successfully, the DynamoDB table will be updated with the *newIncrementalFile*.
+The second step of the `DMSCDCD_ProcessTable` job, is to determine if any incremental files need to be processed by comparing the *lastIncrementalFile* stored in the DynamoDB table with the *newIncrementalFile* retrieved from S3.  If those two values are different it is determined that there are incremental files and the [LoadIncremental](#LoadIncremental) glue job is triggered.  The controller will wait for its completion using the *testGlueJob* function. If the job completes successfully, the DynamoDB table will be updated with the *newIncrementalFile*.
+
 ```python
-    loadIncremental = False
-    newIncrementalFile = path + '0.csv'
-
-    if activeFlag == 'true':
-      incrementalFiles = s3conn.list_objects(Bucket=bucket, Prefix=full_folder+'2').get('Contents')
-      if incrementalFiles is not None:
-          filecount = len(incrementalFiles)
-          newIncrementalFile = bucket + '/' + incrementalFiles[filecount-1]['Key']
-          if newIncrementalFile != lastIncrementalFile:
-              loadIncremental = True
-              message = "Starting to process incremental files"
-          else:
-              message = "Incremental files already processed."
-      else:
-          message = "No incremental files to process."
+loadIncremental = False
+#Get the latest incremental file
+incrementalFiles = s3conn.list_objects_v2(Bucket=bucket, Prefix=full_folder+'2', StartAfter=lastIncrementalFile).get('Contents')
+if incrementalFiles is not None:
+    filecount = len(incrementalFiles)
+    newIncrementalFile = bucket + '/' + incrementalFiles[filecount-1]['Key']
+    if newIncrementalFile != lastIncrementalFile:
+        loadIncremental = True
+        message = 'Starting to process incremental files: ' + full_folder
     else:
-      message = "Load is not active.  Update DynamoDB."
-    print(message)
+        message = 'Incremental files already processed: ' + full_folder
+else:
+    message = 'No incremental files to process: ' + full_folder
+logger.warn(message)
 
-    if loadIncremental:
-        response = glue.start_job_run(
-            JobName='DMSCDC_LoadIncremental',
-            Arguments={
-                '--bucket':bucket,
-                '--prefix':prefix,
-                '--folder':folder,
-                '--out_path':out_path,
-                '--partitionKey':partitionKey,
-                '--lastIncrementalFile' : lastIncrementalFile,
-                '--newIncrementalFile' : newIncrementalFile,
-                '--primaryKey' : primaryKey
-                })
+#Call Incremental Glue Job for this source
+if loadIncremental:
+    args = {
+        '--bucket':bucket,
+        '--prefix':full_folder,
+        '--folder':foldername,
+        '--out_path':out_path,
+        '--partitionKey':partitionKey,
+        '--lastIncrementalFile' : lastIncrementalFile,
+        '--newIncrementalFile' : newIncrementalFile,
+        '--primaryKey' : primaryKey
+        }
+    if runGlueJob('DMSCDC_LoadIncremental',args) != 1:
+        ddbconn.update_item(
+            TableName='DMSCDC_Controller',
+            Key={"path": {"S":path}},
+            AttributeUpdates={"LastIncrementalFile": {"Value": {"S": newIncrementalFile}}})
 
-        if testGlueJob(response['JobRunId'], 30, 30, 'DMSCDC_LoadIncremental') != 1:
-            message = 'Error during Controller execution'
-            raise ValueError(message)
-        else:
-            ddbconn.update_item(
-                TableName='DMSCDC_Controller',
-                Key={"path": {"S":path}},
-                AttributeUpdates={"LastIncrementalFile": {"Value": {"S": newIncrementalFile}}})
 ```
 
 ### LoadInitial
@@ -181,7 +181,8 @@ Note: When the initial job runs, any previously loaded data is overwritten.
 partition_keys = args['partitionKey']
 if partition_keys != "null" :
     partitionKeys = partition_keys.split(",")
-    input.repartition(partitionKeys[0]).write.mode('overwrite').partitionBy(partitionKeys).parquet(s3_outputpath)
+    partitionCount = input.select(partitionKeys).distinct().count()
+    input.repartition(partitionCount,partitionKeys).write.mode('overwrite').partitionBy(partitionKeys).parquet(s3_outputpath)
 else:
     input.write.mode('overwrite').parquet(s3_outputpath)
 ```
@@ -194,20 +195,31 @@ curr_file = args['newIncrementalFile']
 primary_keys = args['primaryKey']
 partition_keys = args['partitionKey']
 
-inputfile = spark.read.parquet(s3_inputpath+"/2*.parquet")
+# gets list of files to process
+inputFileList = []
+results = s3conn.list_objects_v2(Bucket=args['bucket'], Prefix=args['prefix'] +'2', StartAfter=args['lastIncrementalFile']).get('Contents')
+for result in results:
+    if (args['bucket'] + '/' + result['Key'] != last_file):
+        inputFileList.append('s3://' + args['bucket'] + '/' + result['Key'])
 
-inputfile.filter(input_file_name() > last_file)
-inputfile.filter(input_file_name() <= curr_file)
+inputfile = spark.read.parquet(*inputFileList)
 ```
-Next, the process will determine if a primary key has been set in the DynamoDB table.  If it has been set, the change detection process will be executed.  Otherwise, all records marked for insert (where the *Op* = 'I') will be prepped to be written.
+
+Next, the process will determine if a primary key has been set in the DynamoDB table.  If it has been set, the change detection process will be executed.  If it has not, or this is the first time this table is being loaded, only records marked for insert (where the *Op* = 'I') will be prepped to be written.
+
 ```python
-if primary_keys == "null":
+tgtExists = True
+try:
+    test = spark.read.parquet(s3_outputpath)
+except:
+    tgtExists = False
+
+if primary_keys == "null" or not(tgtExists):
     output = inputfile.filter(inputfile.Op=='I')
     filelist = [["null"]]
-  else:
-      primaryKeys = primary_keys.split(",")
 ```
-To process the changed records the process will de-dup the input records as well as determine the impacted data lake files.
+
+Otherwise, to process the changed records the process will de-dup the input records as well as determine the impacted data lake files.
 
 First, a few metadata fields are added to the input data and the already loaded data:
 * sortpath - For already loaded data, this is set to "0" to ensure that newly loaded data with the same primary key will override it.  For new data this is the filename generated by DMS which will have a higher sort order than "0".
@@ -215,157 +227,68 @@ First, a few metadata fields are added to the input data and the already loaded 
 * rownum - This is the relative rownumber of each primary key. For already loaded data, this will always be '1' as there should always be only 1 record for each primary key.  For new data data, this will be a value from 1-to-N for each operation against a primary key.  In the case when there are multiple operations on the same primary key, the latest operation will have the greatest rownum value.
 
 ```python    
-    windowRow = Window.partitionBy(primaryKeys).orderBy(desc("sortpath"))
+primaryKeys = primary_keys.split(",")
+windowRow = Window.partitionBy(primaryKeys).orderBy("sortpath")
 
-    target = spark.read.parquet(s3_outputpath).withColumn("sortpath", lit("0")).withColumn("filepath",input_file_name()).withColumn("rownum", lit(1))
-    input = inputfile.withColumn("sortpath", input_file_name()).withColumn("filepath",input_file_name()).withColumn("rownum", row_number().over(windowRow))
+#Loads the target data adding columns for processing
+target = spark.read.parquet(s3_outputpath).withColumn("sortpath", lit("0")).withColumn("tgt_filepath",input_file_name()).withColumn("rownum", lit(1))
+input = inputfile.withColumn("sortpath", input_file_name()).withColumn("src_filepath",input_file_name()).withColumn("rownum", row_number().over(windowRow))
+
 ```
+
 To determine which data lake files will be impacted, the input data is joined to the target data and a distinct list of files is captured.  
+
 ```python
-    files = target.join(inputfile, primaryKeys, 'inner').select(col("filepath").alias("filepath1")).distinct()
+#determine impacted files
+files = target.join(input, primaryKeys, 'inner').select(col("tgt_filepath").alias("list_filepath")).distinct()
+filelist = files.collect()
 ```
+
 Since S3 data is immutable, not only the records which have changed will need to be written, but also all the unchanged records from the impacted data lake files.  To accomplish this task, a new dataframe will be created which is union of the source and target data.
+
 ```python
-    uniondata = input.select(target.columns).union(target.join(files,files.filepath1==target.filepath).select(target.columns))
+uniondata = input.unionByName(target.join(files,files.list_filepath==target.tgt_filepath), allowMissingColumns=True)
 ```
+
 To determine which rows to write from the union dataframe, a *rnk* column is added indicating the last change for a given primary leveraging the *sortpath* and *rownum* fields which were added.  In addition, only records where the last operation is not a delete (*Op != D*) will be filtered.
+
 ```python
-    window = Window.partitionBy(primaryKeys).orderBy(desc("sortpath"), desc("rownum"))
-    output = uniondata.withColumn('rnk', rank().over(window)).where(col("rnk")==1).where(col("Op")!="D").coalesce(1).select(inputfile.columns)
+window = Window.partitionBy(primaryKeys).orderBy(desc("sortpath"), desc("rownum"))
+output = uniondata.withColumn('rnk', rank().over(window)).where(col("rnk")==1).where(col("Op")!="D").coalesce(1).select(inputfile.columns)
 ```
+
 If a partition key has been set for this table, the data will be written to the Data Lake in the appropriate partitions.  
+
 ```python
+# write data by partitions
 if partition_keys != "null" :
     partitionKeys = partition_keys.split(",")
-    output.repartition(partitionKeys[0]).write.mode('append').partitionBy(partitionKeys).parquet(s3_outputpath)
+    partitionCount = output.select(partitionKeys).distinct().count()
+    output.repartition(partitionCount,partitionKeys).write.mode('append').partitionBy(partitionKeys).parquet(s3_outputpath)
 else:
     output.write.mode('append').parquet(s3_outputpath)
 ```
+
 Finally, the impacted data lake files containing the changed records need to be deleted.  
 
 Note: Because S3 does not guarantee consistency on delete operations, until the file is actually removed from S3, there is a possibility of users seeing duplicate data temporarily.
+
 ```python
-filelist = files.collect()
+#delete old files
 for row in filelist:
     if row[0] != "null":
-        o = urlparse.urlparse(row[0])
-        s3conn.delete_object(Bucket=o.netloc, Key=urllib.unquote(o.path)[1:])
+        o = parse.urlparse(row[0])
+        s3conn.delete_object(Bucket=o.netloc, Key=parse.unquote(o.path)[1:])
 ```
 
 ## Sample Database
 Below is a sample MySQL database you can build and use in conjunction with this project.  It can be used to demonstrate the end-to-end flow of data into your Data Lake.
 
-### MySQL RDS Settings
-In order for a DB to be a candidate for DMS as a source it needs to meet certain [requirements](https://docs.aws.amazon.com/dms/latest/userguide/CHAP_Source.html) whether it's managed through Amazon via RDS or if it's an EC2 or on-premise installation.  
+### Source DB Setup
+In order for a DB to be a candidate for DMS as a source it needs to meet certain [requirements](https://docs.aws.amazon.com/dms/latest/userguide/CHAP_Source.html) whether it's managed through Amazon via RDS or if it's an EC2 or on-premise installation.  Launch the following cloud formation stack to deploy a MySQL DB that has been pre-configured to meet these requirements and which is *pre-loaded* with the [initial load script](DMSCDC_SampleDB_Initial.sql).  Be sure to choose the *same VPC/Subnet/Security Group* as your DMS Replication Instance to ensure they have network connectivity.
 
-In this example, assume we have launched an *RDS* database of type *MySQL*.  After the database has been launched, perform the following actions:
-1. Create a new [Parameter Group](https://console.aws.amazon.com/rds/home?#parameter-groups:) based on the version of MySQL which you are using.
-1. Modify the parameter group parameters setting the following
- * binlog_format: "ROW"
- * binlog_checksum: "NONE"
-1. Modify the database to use the newly created parameter group.
+[![](https://console.aws.amazon.com/cloudformation/home?#/stacks/new?stackName=DMSCDCSampleDB&templateURL=https://s3-us-west-2.amazonaws.com/dmscdc-files/DMSCDC_SampleDB.yaml)](launch-stack.svg)
 
-### Initial Load Script
-#### Create Table Script
-```sql
-create schema if not exists sampledb;
-use sampledb;
-
-drop table if exists store;
-create table store(
-id int,
-address1 varchar(1024),
-city varchar(255),
-state varchar(2),
-countrycode varchar(2),
-postcode varchar(10));
-
-drop table if exists product;
-create table product(
-id int ,
-name varchar(255),
-dept varchar(100),
-category varchar(100),
-price decimal(10,2));
-
-drop table if exists productorder;
-create table productorder (
-id int NOT NULL AUTO_INCREMENT,
-productid int,
-storeid int,
-qty int,
-soldprice decimal(10,2),
-create_dt date,
-PRIMARY KEY (id));
-```
-#### Reference Data Load Script
-```sql
-insert into store (id, address1, city, state, countrycode, postcode) values
-(1001, '320 W. 100th Ave, 100, Southgate Shopping Ctr - Anchorage','Anchorage','AK','US','99515'),
-(1002, '1005 E Dimond Blvd','Anchorage','AK','US','99515'),
-(1003, '1771 East Parks Hwy, Unit #4','Wasilla','AK','US','99654'),
-(1004, '345 South Colonial Dr','Alabaster','AL','US','35007'),
-(1005, '700 Montgomery Hwy, Suite 100','Vestavia Hills','AL','US','35216'),
-(1006, '20701 I-30','Benton','AR','US','72015'),
-(1007, '2034 Fayetteville Rd','Van Buren','AR','US','72956'),
-(1008, '3640 W. Anthem Way','Anthem','AZ','US','85086');
-
-insert into product (id, name, dept, category, price) values
-(1001,'Fire 7','Amazon Devices','Fire Tablets',39),
-(1002,'Fire HD 8','Amazon Devices','Fire Tablets',89),
-(1003,'Fire HD 10','Amazon Devices','Fire Tablets',119),
-(1004,'Fire 7 Kids Edition','Amazon Devices','Fire Tablets',79),
-(1005,'Fire 8 Kids Edition','Amazon Devices','Fire Tablets',99),
-(1006,'Fire HD 10 Kids Edition','Amazon Devices','Fire Tablets',159),
-(1007,'Fire TV Stick','Amazon Devices','Fire TV',49),
-(1008,'Fire TV Stick 4K','Amazon Devices','Fire TV',49),
-(1009,'Fire TV Cube','Amazon Devices','Fire TV',119),
-(1010,'Kindle','Amazon Devices','Kindle E-readers',79),
-(1011,'Kindle Paperwhite','Amazon Devices','Kindle E-readers',129),
-(1012,'Kindle Oasis','Amazon Devices','Kindle E-readers',279),
-(1013,'Echo Dot (3rd Gen)','Amazon Devices','Echo and Alexa',49),
-(1014,'Echo Auto','Amazon Devices','Echo and Alexa',24),
-(1015,'Echo Show (2nd Gen)','Amazon Devices','Echo and Alexa',229),
-(1016,'Echo Plus (2nd Gen)','Amazon Devices','Echo and Alexa',149),
-(1017,'Fire TV Recast','Amazon Devices','Echo and Alexa',229),
-(1018,'EchoSub Bundle with 2 Echo (2nd Gen)','Amazon Devices','Echo and Alexa',279),
-(1019,'Mini Projector','Electronics','Projectors',288),
-(1020,'TOUMEI Mini Projector','Electronics','Projectors',300),
-(1021,'InFocus IN114XA Projector, DLP XGA 3600 Lumens 3D Ready 2HDMI Speakers','Electronics','Projectors',350),
-(1022,'Optoma X343 3600 Lumens XGA DLP Projector with 15,000-hour Lamp Life','Electronics','Projectors',339),
-(1023,'TCL 55S517 55-Inch 4K Ultra HD Roku Smart LED TV (2018 Model)','Electronics','TV',379),
-(1024,'Samsung 55NU7100 Flat 55” 4K UHD 7 Series Smart TV 2018','Electronics','TV',547),
-(1025,'LG Electronics 55UK6300PUE 55-Inch 4K Ultra HD Smart LED TV (2018 Model)','Electronics','TV',496);
-
-```
-#### Transaction Data Load Script
-To populate the transaction data, use the procedure to insert *OrderCnt* rows each with a random value for *Store* and *Product*.
-```sql
-CREATE PROCEDURE loadorders (
-  IN OrderCnt int,
-  IN create_dt date
-)
-BEGIN
-  DECLARE i INT DEFAULT 0;
-  helper: LOOP
-    IF i<OrderCnt THEN
-      INSERT INTO productorder(productid, storeid, qty, soldprice, create_dt)
-         values (1000+ceil(rand()*25), 1000+ceil(rand()*8), ceil(rand()*10), rand()*100, create_dt) ;
-      SET i = i+1;
-      ITERATE helper;
-    ELSE
-      LEAVE  helper;
-    END IF;     
-  END LOOP;
-END
-```
-```sql
-call loadorders(1010, '2018-11-27');
-call loadorders(1196, '2018-12-03');
-call loadorders(4250, '2018-12-10');
-call loadorders(1246, '2018-12-13');
-call loadorders(723, '2018-11-28');
-```
 ### Incremental Load Script
 Before proceeding with the incremental load, ensure that
 1. The initial data has arrived in the DMS bucket.
@@ -380,4 +303,4 @@ call loadorders(1345, current_date);
 insert into store values(1009, '125 Technology Dr.', 'Irvine', 'CA', 'US', '92618');
 ```
 
-Once DMS has processed these changes, you will see new incremental files for store, product, and productorder in the DMS bucket.  On the next execution of the Glue job, you will see new and updated files in the LAKE bucket. Test.
+Once DMS has processed these changes, you will see new incremental files for `store`, `product`, and `productorder` in the DMS bucket.  On the next execution of the Glue job, you will see new and updated files in the LAKE bucket. Test.

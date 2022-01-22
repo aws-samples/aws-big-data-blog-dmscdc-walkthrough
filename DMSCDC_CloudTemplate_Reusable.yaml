@@ -1,9 +1,18 @@
 AWSTemplateFormatVersion: 2010-09-09
+Parameters:
+  SecurityGroup:
+    Description: Sec Group for Replication Instance with rules to allow it to connect to your source DB.
+    Type: AWS::EC2::SecurityGroup::Id
+  Subnet1:
+    Description: Subnet-1 for Replication Instance with network path to source DB.
+    Type: AWS::EC2::Subnet::Id
+  Subnet2:
+    Description: Subnet-2 for Replication Instance with network path to source DB.
+    Type: AWS::EC2::Subnet::Id
 Resources:
-  DMSCloudWatchLogsRole:
+  LambdaRoleToInitDMS:
     Type: AWS::IAM::Role
-    Properties:
-      RoleName: dms-cloudwatch-logs-role
+    Properties :
       AssumeRolePolicyDocument:
         Version : 2012-10-17
         Statement :
@@ -11,37 +20,141 @@ Resources:
             Effect : Allow
             Principal :
               Service :
-                - dms.amazonaws.com
+                - lambda.amazonaws.com
             Action :
               - sts:AssumeRole
       Path : /
+      Policies:
+        -
+          PolicyName: LambdaCloudFormationPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              -
+                Effect: Allow
+                Action:
+                  - s3:*
+                Resource:
+                  - !Sub "arn:aws:s3:::cloudformation-custom-resource-response-${AWS::Region}"
+                  - !Sub "arn:aws:s3:::cloudformation-waitcondition-${AWS::Region}"
+                  - !Sub "arn:aws:s3:::cloudformation-custom-resource-response-${AWS::Region}/*"
+                  - !Sub "arn:aws:s3:::cloudformation-waitcondition-${AWS::Region}/*"
       ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AmazonDMSCloudWatchLogsRole
-  DMSVPCRole:
-    Type: AWS::IAM::Role
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+        - arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+        - arn:aws:iam::aws:policy/AmazonRDSDataFullAccess
+        - arn:aws:iam::aws:policy/IAMFullAccess
+        - arn:aws:iam::aws:policy/AmazonRedshiftFullAccess
+  LambdaFunctionDMSRoles:
+    Type: "AWS::Lambda::Function"
     Properties:
-      RoleName: dms-vpc-role
-      AssumeRolePolicyDocument:
-        Version : 2012-10-17
-        Statement :
-          -
-            Effect : Allow
-            Principal :
-              Service :
-                - dms.amazonaws.com
-            Action :
-              - sts:AssumeRole
-      Path : /
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AmazonDMSVPCManagementRole
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+          import logging
+          import time
+          client = boto3.client('iam')
+          logging.basicConfig()
+          logger = logging.getLogger(__name__)
+          logger.setLevel(logging.INFO)
+
+          def handler(event, context):
+            logger.info(json.dumps(event))
+
+            if event['RequestType'] == 'Delete':
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, {'Data': 'Delete complete'})
+            else:
+              try:
+                response = client.get_role(RoleName='dms-cloudwatch-logs-role')
+              except:
+                try:
+                  role_policy_document = {
+                      "Version": "2012-10-17",
+                      "Statement": [
+                        {
+                          "Effect": "Allow",
+                          "Principal": {
+                            "Service": [
+                              "dms.amazonaws.com"
+                            ]
+                          },
+                          "Action": "sts:AssumeRole"
+                        }
+                      ]
+                  }
+                  client.create_role(
+                      RoleName='dms-cloudwatch-logs-role',
+                      AssumeRolePolicyDocument=json.dumps(role_policy_document)
+                  )
+                  client.attach_role_policy(
+                    RoleName='dms-cloudwatch-logs-role',
+                    PolicyArn='arn:aws:iam::aws:policy/service-role/AmazonDMSCloudWatchLogsRole'
+                  )
+                except Exception as e:
+                  logger.error(e)
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Data': 'Create failed'})
+              try:
+                response = client.get_role(RoleName='dms-vpc-role')
+              except:
+                try:
+                  role_policy_document = {
+                      "Version": "2012-10-17",
+                      "Statement": [
+                        {
+                          "Effect": "Allow",
+                          "Principal": {
+                            "Service": [
+                              "dms.amazonaws.com"
+                            ]
+                          },
+                          "Action": "sts:AssumeRole"
+                        }
+                      ]
+                  }
+                  client.create_role(
+                      RoleName='dms-vpc-role',
+                      AssumeRolePolicyDocument=json.dumps(role_policy_document)
+                  )
+                  client.attach_role_policy(
+                    RoleName='dms-vpc-role',
+                    PolicyArn='arn:aws:iam::aws:policy/service-role/AmazonDMSVPCManagementRole'
+                  )
+                  time.sleep(30)
+                except Exception as e:
+                  logger.error(e)
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Data': 'Create failed'})
+
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, {'Data': 'Create complete'})
+      Handler: index.handler
+      Role:
+        Fn::GetAtt: [LambdaRoleToInitDMS, Arn]
+      Runtime: python3.7
+  InitDMSRoles:
+     Type: Custom::InitDMSRoles
+     DependsOn:
+       - LambdaFunctionDMSRoles
+     Properties:
+       ServiceToken: !GetAtt 'LambdaFunctionDMSRoles.Arn'
+  DMSSubnetGroup:
+    Type: AWS::DMS::ReplicationSubnetGroup
+    Properties:
+      ReplicationSubnetGroupDescription: Subnet group for DMSCDC pipeline.
+      SubnetIds:
+        - !Ref Subnet1
+        - !Ref Subnet2
   DMSReplicationInstance:
     Type: AWS::DMS::ReplicationInstance
     DependsOn:
-      - DMSVPCRole
-      - DMSCloudWatchLogsRole
+      - InitDMSRoles
     Properties:
       ReplicationInstanceIdentifier: DMSCDC-ReplicationInstance
       ReplicationInstanceClass: dms.c4.large
+      VpcSecurityGroupIds:
+          - !Ref SecurityGroup
   ExecutionRole:
     Type: AWS::IAM::Role
     Properties :
@@ -84,7 +197,7 @@ Resources:
                   - dms:StartReplicationTask
                   - dms:TestConnection
                   - dms:StopReplicationTask
-                Resource:                
+                Resource:
                   - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/DMSCDC_Controller'
                   - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:DMSCDC_InitController'
                   - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:DMSCDC_InitDMS'
@@ -125,6 +238,8 @@ Resources:
                 s3.delete_object(Bucket=glueBucket, Key='DMSCDC_LoadIncremental.py.temp')
                 s3.delete_object(Bucket=glueBucket, Key='DMSCDC_LoadInitial.py')
                 s3.delete_object(Bucket=glueBucket, Key='DMSCDC_LoadInitial.py.temp')
+                s3.delete_object(Bucket=glueBucket, Key='DMSCDC_ProcessTable.py')
+                s3.delete_object(Bucket=glueBucket, Key='DMSCDC_ProcessTable.py.temp')
                 s3.delete_object(Bucket=glueBucket, Key='DMSCDC_Controller.py')
                 s3.delete_object(Bucket=glueBucket, Key='DMSCDC_Controller.py.temp')
               except Exception as e:
@@ -147,15 +262,20 @@ Resources:
               except Exception as e:
                 logger.info(e.message)
               try:
+                s3.delete_object(Bucket=glueBucket, Key='DMSCDC_ProcessTable.py')
+              except Exception as e:
+                logger.info(e.message)
+              try:
                 s3.copy_object(Bucket=glueBucket, CopySource="dmscdc-files/DMSCDC_LoadIncremental.py", Key="DMSCDC_LoadIncremental.py")
                 s3.copy_object(Bucket=glueBucket, CopySource="dmscdc-files/DMSCDC_LoadInitial.py", Key="DMSCDC_LoadInitial.py")
                 s3.copy_object(Bucket=glueBucket, CopySource="dmscdc-files/DMSCDC_Controller.py", Key="DMSCDC_Controller.py")
+                s3.copy_object(Bucket=glueBucket, CopySource="dmscdc-files/DMSCDC_ProcessTable.py", Key="DMSCDC_ProcessTable.py")
 
                 logger.info('Copy Complete')
                 cfnresponse.send(event, context, cfnresponse.SUCCESS, {'Data': 'Copy complete'})
 
               except Exception as e:
-                message = 'S3 Issue: '  + e.message
+                message = 'S3 Issue: '  + str(e)
                 logger.error(message)
                 cfnresponse.send(event, context, cfnresponse.FAILED, {'Data': message})
 
@@ -212,6 +332,7 @@ Resources:
           def handler(event, context):
             logger.info(json.dumps(event))
             if event['RequestType'] != 'Create':
+                logger.info('No action necessary')
                 cfnresponse.send(event, context, cfnresponse.SUCCESS, {'Data': 'NA'})
             else:
                 try:
@@ -244,7 +365,7 @@ Resources:
                       logger.info(message)
                       cfnresponse.send(event, context, cfnresponse.SUCCESS, {'Data': message})
                 except Exception as e:
-                  message = 'Glue Job Issue: ' + e.message
+                  message = 'Glue Job Issue: ' + str(e)
                   logger.info(message)
                   cfnresponse.send(event, context, cfnresponse.FAILED, {'Data': message})
       Handler: index.handler
@@ -318,7 +439,7 @@ Resources:
                   s3.Bucket(dmsBucket).objects.all().delete()
                   logger.info('Task Stopped, Bucket Emptied')
                 except Exception as e:
-                  message = 'Issue with Stopping Task or Emptying Bucket:' + e.message
+                  message = 'Issue with Stopping Task or Emptying Bucket:' + str(e)
                   logger.error(message)
                 cfnresponse.send(event, context, cfnresponse.SUCCESS, {'Data': 'NA'})
             else:
@@ -348,7 +469,7 @@ Resources:
                       cfnresponse.send(event, context, cfnresponse.FAILED, {'Data': message})
 
                 except Exception as e:
-                  message = 'DMS Endpoint Issue: ' + e.message
+                  message = 'DMS Endpoint Issue: ' + str(e)
                   logger.error(message)
                   cfnresponse.send(event, context, cfnresponse.FAILED, {'Data': message})
 
@@ -359,15 +480,15 @@ Resources:
                       StartReplicationTaskType='start-replication')
                     if testRepTask(taskArn, 10) != 1:
                       message = 'Error during DMS execution'
-                      logger.error('message')
+                      logger.error(message)
                       cfnresponse.send(event, context, cfnresponse.FAILED, {'Data': message})
                     else:
                       message = 'DMS Execution Successful'
-                      logger.info('message')
+                      logger.info(message)
                       cfnresponse.send(event, context, cfnresponse.SUCCESS, {'Data': message})
                 except Exception as e:
-                  message = 'DMS Task Issue: ' + e.message
-                  logger.error('message')
+                  message = 'DMS Task Issue: ' + str(e)
+                  logger.error(message)
                   cfnresponse.send(event, context, cfnresponse.FAILED, {'Data': message})
 
       Handler: index.handler
@@ -385,8 +506,9 @@ Resources:
       Role:
         Fn::GetAtt: [ExecutionRole, Arn]
       ExecutionProperty:
-        MaxConcurrentRuns: 10
+        MaxConcurrentRuns: 50
       AllocatedCapacity: 2
+      GlueVersion: 3.0
       Command:
         Name: glueetl
         ScriptLocation: !Sub
@@ -407,8 +529,9 @@ Resources:
       Role:
         Fn::GetAtt: [ExecutionRole, Arn]
       ExecutionProperty:
-        MaxConcurrentRuns: 10
+        MaxConcurrentRuns: 50
       AllocatedCapacity: 2
+      GlueVersion: 3.0
       Command:
         Name: glueetl
         ScriptLocation: !Sub
@@ -429,12 +552,34 @@ Resources:
       Role:
         Fn::GetAtt: [ExecutionRole, Arn]
       ExecutionProperty:
-        MaxConcurrentRuns: 10
+        MaxConcurrentRuns: 50
       Command:
         Name: pythonshell
         PythonVersion: 3
         ScriptLocation: !Sub
           - s3://${bucket}/DMSCDC_Controller.py
+          - {bucket: !Ref GlueBucket}
+      DefaultArguments:
+        "--job-bookmark-option" : "job-bookmark-disable"
+        "--TempDir" : !Sub
+          - s3://${bucket}
+          - {bucket: !Ref GlueBucket}
+        "--enable-metrics" : ""
+    DependsOn:
+      - ExecutionRole
+  GlueJobProcessTable:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: DMSCDC_ProcessTable
+      Role:
+        Fn::GetAtt: [ExecutionRole, Arn]
+      ExecutionProperty:
+        MaxConcurrentRuns: 50
+      Command:
+        Name: pythonshell
+        PythonVersion: 3
+        ScriptLocation: !Sub
+          - s3://${bucket}/DMSCDC_ProcessTable.py
           - {bucket: !Ref GlueBucket}
       DefaultArguments:
         "--job-bookmark-option" : "job-bookmark-disable"

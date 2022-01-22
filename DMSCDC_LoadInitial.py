@@ -22,7 +22,7 @@ spark = glueContext.spark_session
 job = Job(glueContext)
 job.init(args['JOB_NAME'], args)
 
-s3_inputpath = 's3://' + args['bucket'] + '/' + args['prefix'] + args['folder']
+s3_inputpath = 's3://' + args['bucket'] + '/' + args['prefix']
 s3_outputpath = 's3://' + args['out_path'] + args['folder']
 
 input = spark.read.parquet(s3_inputpath+"/LOAD*.parquet").withColumn("Op", lit("I"))
@@ -30,7 +30,8 @@ input = spark.read.parquet(s3_inputpath+"/LOAD*.parquet").withColumn("Op", lit("
 partition_keys = args['partitionKey']
 if partition_keys != "null" :
     partitionKeys = partition_keys.split(",")
-    input.repartition(partitionKeys[0]).write.mode('overwrite').partitionBy(partitionKeys).parquet(s3_outputpath)
+    partitionCount = input.select(partitionKeys).distinct().count()
+    input.repartition(partitionCount,partitionKeys).write.mode('overwrite').partitionBy(partitionKeys).parquet(s3_outputpath)
 else:
     input.write.mode('overwrite').parquet(s3_outputpath)
 

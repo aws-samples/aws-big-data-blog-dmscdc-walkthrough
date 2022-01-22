@@ -1,30 +1,8 @@
 AWSTemplateFormatVersion: 2010-09-09
-Conditions:
-  IsDatabase:
-    Fn::Or:
-      - Fn::Equals:
-          - Ref: DBEngine
-          - db2
-      - Fn::Equals:
-          - Ref: DBEngine
-          - azuredb
-      - Fn::Equals:
-          - Ref: DBEngine
-          - sqlserver
-      - Fn::Equals:
-          - Ref: DBEngine
-          - oracle
-      - Fn::Equals:
-          - Ref: DBEngine
-          - postgres
-      - Fn::Equals:
-          - Ref: DBEngine
-          - sybase
 Parameters:
   DBEngine:
     Description: Choose the source DB engine to stream changes.
     Type: String
-    Default: mysql
     AllowedValues:
       - mysql
       - oracle
@@ -59,24 +37,38 @@ Parameters:
     Type: String
     Default: "%"
     AllowedPattern: ^[a-zA-Z0-9-_%]*$
-    ConstraintDescription: Must only contain uppe/lower-case letters, numbers, -, _, or %.
+    ConstraintDescription: Must only contain upper/lower-case letters, numbers, -, _, or %.
   DMSSchemaFilter:
     Description: Choose the DMS schema filter criteria.
     Type: String
-    Default: ""
-    AllowedPattern: ^[a-zA-Z0-9_-]*$
-    ConstraintDescription: Must only contain uppe/lower-case letters, numbers, -, or _.
+    Default: "%"
+    AllowedPattern: ^[a-zA-Z0-9-_%]*$
+    ConstraintDescription: Must only contain upper/lower-case letters, numbers, -, or _.
+  CreateDMSBucket:
+    Description: Select Yes to create a new bucket and No to use an existing bucket
+    Type: String
+    Default: 'Yes'
+    AllowedValues:
+    - 'Yes'
+    - 'No'
   DMSBucket:
     Description: Name of the Bucket to land the DMS data.
     Type: String
   DMSFolder:
-    Description: (Optional) Prefix within bucket to store DMS data.
+    Description: (Optional) Prefix within bucket to store DMS data.  Please omit the trailing /
     Type: String
+  CreateLakeBucket:
+    Description: Select Yes to create a new bucket and No to use an existing bucket
+    Type: String
+    Default: 'Yes'
+    AllowedValues:
+    - 'Yes'
+    - 'No'
   LakeBucket:
     Description: Name of the Bucket to land the processed data.
     Type: String
   LakeFolder:
-    Description: (Optional) Prefix within bucket to store processed data.
+    Description: (Optional) Prefix within bucket to store processed data.  Please omit the trailing /
     Type: String
   LakeDBName:
     Description: Name to be used in analytical tools such as Athena and Redshift to reference these tables within the data lake.
@@ -89,6 +81,15 @@ Parameters:
     Description: "Crawler Execution Schedule Cron Expression. Default is daily at 12:30 AM GMT: https://docs.aws.amazon.com/AmazonCloudWatch/latest/events/ScheduledEvents.html"
     Type: String
     Default: cron(30 0 * * ? *)
+Conditions:
+  IsDMSFolderEmpty: !Equals [!Ref "DMSFolder", ""]
+  IsLakeFolderEmpty: !Equals [!Ref "LakeFolder", ""]
+  CreateDMSBucket: !Equals
+    - !Ref CreateDMSBucket
+    - 'Yes'
+  CreateLakeBucket: !Equals
+    - !Ref CreateLakeBucket
+    - 'Yes'
 Metadata:
   AWS::CloudFormation::Interface:
     ParameterGroups:
@@ -109,12 +110,14 @@ Metadata:
           - DMSReplicationInstanceArn
           - DMSTableFilter
           - DMSSchemaFilter
+          - CreateDMSBucket
           - DMSBucket
           - DMSFolder
       -
         Label:
           default: "Data Lake Configuration"
         Parameters:
+          - CreateLakeBucket
           - LakeBucket
           - LakeFolder
           - LakeDBName
@@ -136,11 +139,9 @@ Resources:
       Password:
         Ref: DBPassword
       DatabaseName:
-        Fn::If:
-          - IsDatabase
-          - Ref: DBName
-          - Ref: AWS::NoValue
+        Ref: DBName
   DMSRawBucket:
+    Condition: CreateDMSBucket
     Type: AWS::S3::Bucket
     Properties:
       BucketName:
@@ -150,12 +151,12 @@ Resources:
     Properties:
         EndpointType: target
         EngineName: s3
-        ExtraConnectionAttributes : "dataFormat=parquet"
+        ExtraConnectionAttributes : "dataFormat=parquet;includeOpForFullLoad=true;;parquetTimestampInMillisecond=true;"
         S3Settings :
             BucketFolder:
-                Ref: DMSFolder
+              Ref: DMSFolder
             BucketName:
-                Ref: DMSBucket
+              Ref: DMSBucket
             ServiceAccessRoleArn: !Sub 'arn:aws:iam::${AWS::AccountId}:role/DMSCDC_Execution_Role'
   DMSReplicationTask:
     Type: AWS::DMS::ReplicationTask
@@ -172,11 +173,8 @@ Resources:
       TargetEndpointArn:
         Ref: DMSTargetEndpoint
       ReplicationTaskSettings: "{\"Logging\": {\"EnableLogging\": true }}"
-    DependsOn:
-      - DMSTargetEndpoint
-      - DMSSourceEndpoint
-      - DMSRawBucket
   DataLakeBucket:
+    Condition: CreateDMSBucket
     Type: 'AWS::S3::Bucket'
     Properties:
       BucketName:
@@ -194,12 +192,21 @@ Resources:
         - JobName: DMSCDC_Controller
           Arguments:
             '--bucket': !Ref DMSBucket
-            '--prefix': !Sub
-              - '${prefix}${schema}/'
-              - prefix: !Ref DMSFolder
-                schema: !Ref DMSSchemaFilter
+            '--prefix':
+              Fn::If:
+                - IsDMSFolderEmpty
+                - !Ref DMSFolder
+                - !Sub
+                  - '${prefix}/'
+                  - prefix: !Ref DMSFolder
             '--out_bucket': !Ref LakeBucket
-            '--out_prefix': !Ref LakeFolder
+            '--out_prefix':
+              Fn::If:
+                - IsLakeFolderEmpty
+                - !Ref LakeFolder
+                - !Sub
+                  - '${prefix}/'
+                  - prefix: !Ref LakeFolder
   GlueCrawler:
     Type: AWS::Glue::Crawler
     Properties:
@@ -217,7 +224,12 @@ Resources:
                 - "/"
                 -
                   - Ref : LakeBucket
-                  - Ref : LakeFolder
+                  - Fn::If:
+                      - IsLakeFolderEmpty
+                      - !Ref LakeFolder
+                      - !Sub
+                        - '${prefix}/'
+                        - prefix: !Ref LakeFolder
   InitDMS:
     Type: Custom::InitDMS
     DependsOn:
@@ -241,5 +253,11 @@ Resources:
         - "${prefix}${schema}/"
         - { prefix: !Ref DMSFolder,schema: !Ref DMSSchemaFilter}
       lakeBucket: !Ref LakeBucket
-      lakePath: !Ref LakeFolder
+      lakePath:
+        Fn::If:
+          - IsLakeFolderEmpty
+          - !Ref LakeFolder
+          - !Sub
+            - '${prefix}/'
+            - prefix: !Ref LakeFolder
       lakeDBName: !Ref LakeDBName

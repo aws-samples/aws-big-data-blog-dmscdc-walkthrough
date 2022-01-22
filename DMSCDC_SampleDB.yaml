@@ -1,0 +1,189 @@
+AWSTemplateFormatVersion: 2010-09-09
+Parameters:
+  DBUser:
+    Description: Username for the source DB.
+    Type: String
+  DBPassword:
+    Description: Password for the source DB.
+    Type: String
+    NoEcho: true
+  DBName:
+    Description: Name of the source DB.
+    Type: String
+  SecurityGroup:
+    Description: Sec Group for RDS & Lambda
+    Type: AWS::EC2::SecurityGroup::Id
+  Subnet1:
+    Description: Subnet-1 for RDS & Lambda
+    Type: AWS::EC2::Subnet::Id
+  Subnet2:
+    Description: Subnet-2 for RDS & Lambda
+    Type: AWS::EC2::Subnet::Id
+Resources:
+  InitRole:
+    Type: AWS::IAM::Role
+    Properties :
+      AssumeRolePolicyDocument:
+        Version : 2012-10-17
+        Statement :
+          -
+            Effect : Allow
+            Principal :
+              Service :
+                - lambda.amazonaws.com
+            Action :
+              - sts:AssumeRole
+      Path : /
+      Policies:
+        -
+          PolicyName: LambdaCloudFormationPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              -
+                Effect: Allow
+                Action:
+                  - s3:*
+                Resource:
+                  - !Sub "arn:aws:s3:::cloudformation-custom-resource-response-${AWS::Region}"
+                  - !Sub "arn:aws:s3:::cloudformation-waitcondition-${AWS::Region}"
+                  - !Sub "arn:aws:s3:::cloudformation-custom-resource-response-${AWS::Region}/*"
+                  - !Sub "arn:aws:s3:::cloudformation-waitcondition-${AWS::Region}/*"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+  RDSDBParameterGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      Description: DMDCDC-MySQL
+      Family: mysql5.7
+      Parameters:
+        binlog_format : 'ROW'
+        binlog_checksum : 'NONE'
+  RDSSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnet for DMSCDC-MySql
+      SubnetIds:
+        - !Ref Subnet1
+        - !Ref Subnet2
+  RDSDB:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBParameterGroupName: !Ref RDSDBParameterGroup
+      DBName: !Ref DBName
+      Engine: mysql
+      EngineVersion: 5.7
+      DBInstanceClass: db.t2.micro
+      StorageType: gp2
+      PubliclyAccessible: True
+      AllocatedStorage: 20
+      MasterUserPassword: !Ref DBPassword
+      MasterUsername: !Ref DBUser
+      DBSubnetGroupName: !Ref RDSSubnetGroup
+      VPCSecurityGroups:
+        - !Ref SecurityGroup
+  RDSLoadLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Role: !GetAtt 'InitRole.Arn'
+      Layers:
+        - !Ref PymysqlLayer
+      Handler: index.handler
+      Runtime: python3.9
+      Timeout: 30
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref SecurityGroup
+        SubnetIds:
+          - !Ref Subnet1
+          - !Ref Subnet2
+      Code:
+        ZipFile: |
+          import sys, logging, pymysql, json, urllib3
+          from pymysql.constants import CLIENT
+          http = urllib3.PoolManager()
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def send(event, context, responseStatus, responseData):
+            responseUrl = event['ResponseURL']
+            responseBody = {
+                'Status' : responseStatus,
+                'Reason' : "See the details in CloudWatch Log Stream: {}".format(context.log_stream_name),
+                'PhysicalResourceId' : context.log_stream_name,
+                'StackId' : event['StackId'],
+                'RequestId' : event['RequestId'],
+                'LogicalResourceId' : event['LogicalResourceId'],
+                'NoEcho' : False,
+                'Data' : responseData
+            }
+            json_responseBody = json.dumps(responseBody)
+            headers = {
+                'content-type' : '',
+                'content-length' : str(len(json_responseBody))
+            }
+            try:
+                response = http.request('PUT', responseUrl, headers=headers, body=json_responseBody)
+            except Exception as e:
+                print("send(..) failed executing http.request(..):", e)
+
+          def handler(event, context):
+            print("Received event: " + json.dumps(event, indent=2))
+
+            if event['RequestType'] == 'Delete':
+              send(event, context, 'SUCCESS', {'Data': 'Delete complete'})
+            else:
+              host  = event['ResourceProperties']['host']
+              username = event['ResourceProperties']['username']
+              password = event['ResourceProperties']['password']
+              dbname = event['ResourceProperties']['dbname']
+              script = event['ResourceProperties']['script']
+
+            try:
+              conn = pymysql.connect(host=host, user=username, passwd=password, db=dbname, connect_timeout=5, client_flag= CLIENT.MULTI_STATEMENTS)
+            except Exception as e:
+              print(str(e))
+              send(event, context, 'FAILED', {'Data': 'Connect failed'})
+              sys.exit()
+
+            try:
+              response = http.request('GET', script, preload_content=False)
+              script_content = response.read()
+            except Exception as e:
+              print(str(e))
+              send(event, context, 'FAILED', {'Data': 'Open script failed'})
+              sys.exit()
+
+            try:
+              cur = conn.cursor()
+              response = cur.execute(script_content.decode('utf-8'))
+              conn.commit()
+              send(event, context, 'SUCCESS', {'Data': 'Insert complete'})
+            except Exception as e:
+              print(str(e))
+              send(event, context, 'FAILED', {'Data': 'Insert failed'})
+  RDSLoadInit:
+    Type: Custom::RDSLoadInit
+    DependsOn:
+      - RDSLoadLambda
+    Properties:
+      ServiceToken: !GetAtt 'RDSLoadLambda.Arn'
+      host: !GetAtt 'RDSDB.Endpoint.Address'
+      username: !Ref DBUser
+      password: !Ref DBPassword
+      dbname: !Ref DBName
+      script: https://dmscdc-files.s3.us-west-2.amazonaws.com/DMSCDC_SampleDB_Initial.sql
+  PymysqlLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      CompatibleRuntimes:
+        - python3.8
+        - python3.9
+      Content:
+        S3Bucket: dmscdc-files
+        S3Key: pymysql.zip
+Outputs:
+  RDSEndpoint:
+    Description: Cluster endpoint
+    Value: !Sub "${RDSDB.Endpoint.Address}:${RDSDB.Endpoint.Port}"
