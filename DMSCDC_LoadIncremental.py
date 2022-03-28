@@ -39,7 +39,8 @@ partition_keys = args['partitionKey']
 
 # gets list of files to process
 inputFileList = []
-results = s3conn.list_objects_v2(Bucket=args['bucket'], Prefix=args['prefix'] +'2', StartAfter=args['lastIncrementalFile']).get('Contents')
+startAfterParameter = last_file[len(args['bucket']) + 1:]
+results = s3conn.list_objects_v2(Bucket=args['bucket'], Prefix=args['prefix'] +'2', StartAfter=startAfterParameter).get('Contents')
 for result in results:
     if (args['bucket'] + '/' + result['Key'] != last_file):
         inputFileList.append('s3://' + args['bucket'] + '/' + result['Key'])
