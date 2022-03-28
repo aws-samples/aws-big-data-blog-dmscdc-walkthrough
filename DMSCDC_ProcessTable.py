@@ -90,7 +90,8 @@ if loadInitial:
 
 loadIncremental = False
 #Get the latest incremental file
-incrementalFiles = s3conn.list_objects_v2(Bucket=bucket, Prefix=full_folder+'2', StartAfter=lastIncrementalFile).get('Contents')
+startAfterParameter = lastIncrementalFile[len(bucket) + 1:]
+incrementalFiles = s3conn.list_objects_v2(Bucket=bucket, Prefix=full_folder+'2', StartAfter=startAfterParameter).get('Contents')
 if incrementalFiles is not None:
     filecount = len(incrementalFiles)
     newIncrementalFile = bucket + '/' + incrementalFiles[filecount-1]['Key']
