@@ -141,6 +141,8 @@ Resources:
        ServiceToken: !GetAtt 'LambdaFunctionDMSRoles.Arn'
   DMSSubnetGroup:
     Type: AWS::DMS::ReplicationSubnetGroup
+    DependsOn:
+      - InitDMSRoles
     Properties:
       ReplicationSubnetGroupDescription: Subnet group for DMSCDC pipeline.
       SubnetIds:
@@ -153,6 +155,7 @@ Resources:
     Properties:
       ReplicationInstanceIdentifier: DMSCDC-ReplicationInstance
       ReplicationInstanceClass: dms.c4.large
+      ReplicationSubnetGroupIdentifier: !Ref DMSSubnetGroup
       VpcSecurityGroupIds:
           - !Ref SecurityGroup
   ExecutionRole:
