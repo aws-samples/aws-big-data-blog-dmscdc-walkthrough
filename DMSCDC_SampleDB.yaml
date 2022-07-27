@@ -140,29 +140,29 @@ Resources:
               dbname = event['ResourceProperties']['dbname']
               script = event['ResourceProperties']['script']
 
-            try:
-              conn = pymysql.connect(host=host, user=username, passwd=password, db=dbname, connect_timeout=5, client_flag= CLIENT.MULTI_STATEMENTS)
-            except Exception as e:
-              print(str(e))
-              send(event, context, 'FAILED', {'Data': 'Connect failed'})
-              sys.exit()
+              try:
+                conn = pymysql.connect(host=host, user=username, passwd=password, db=dbname, connect_timeout=5, client_flag= CLIENT.MULTI_STATEMENTS)
+              except Exception as e:
+                print(str(e))
+                send(event, context, 'FAILED', {'Data': 'Connect failed'})
+                sys.exit()
 
-            try:
-              response = http.request('GET', script, preload_content=False)
-              script_content = response.read()
-            except Exception as e:
-              print(str(e))
-              send(event, context, 'FAILED', {'Data': 'Open script failed'})
-              sys.exit()
+              try:
+                response = http.request('GET', script, preload_content=False)
+                script_content = response.read()
+              except Exception as e:
+                print(str(e))
+                send(event, context, 'FAILED', {'Data': 'Open script failed'})
+                sys.exit()
 
-            try:
-              cur = conn.cursor()
-              response = cur.execute(script_content.decode('utf-8'))
-              conn.commit()
-              send(event, context, 'SUCCESS', {'Data': 'Insert complete'})
-            except Exception as e:
-              print(str(e))
-              send(event, context, 'FAILED', {'Data': 'Insert failed'})
+              try:
+                cur = conn.cursor()
+                response = cur.execute(script_content.decode('utf-8'))
+                conn.commit()
+                send(event, context, 'SUCCESS', {'Data': 'Insert complete'})
+              except Exception as e:
+                print(str(e))
+                send(event, context, 'FAILED', {'Data': 'Insert failed'})
   RDSLoadInit:
     Type: Custom::RDSLoadInit
     DependsOn:
